@@ -23,8 +23,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Repair two transport-only transcription artefacts. The first 10,000 bytes
-          # of part06 were verified block-for-block against the local source bundle.
           sed -i 's/Z28NYzah3Ed/Z28NYwah3Ed/' .bootstrap/bundle.part05
           python3 - <<'PY'
           from pathlib import Path
@@ -33,11 +31,13 @@ jobs:
           if len(data) < 10000:
               raise SystemExit(f'part06 too short: {len(data)}')
           p.write_bytes(data[:10000])
-          print('part06_normalized_length', p.stat().st_size)
           PY
           cat .bootstrap/bundle.part* > /tmp/native-parity.b64
           base64 --decode /tmp/native-parity.b64 > /tmp/native-parity.tar.gz
           tar -xzf /tmp/native-parity.tar.gz -C .
+          # GITHUB_TOKEN cannot update workflow files. Keep the currently-authorized
+          # workflow files here; ChatGPT updates build.yml separately after this push.
+          git checkout HEAD -- .github/workflows/build.yml .github/workflows/bootstrap-parity.yml
           mkdir -p resources
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
