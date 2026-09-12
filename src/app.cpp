@@ -39,6 +39,9 @@ char b[32];std::strftime(b,sizeof(b),"%Y%m%d-%H%M%S",&tm);return b;}
 bool write_json(const fs::path&p,const json&j){std::ofstream f(p,std::ios::binary);if(!f)return false;f<<j.dump(2);return(bool)f;}
 json read_json(const fs::path&p){std::ifstream f(p,std::ios::binary);if(!f)return json();try{return json::parse(f);}catch(...){return json();}}
 std::string flatten_scalar(const json&v){if(v.is_string())return v.get<std::string>();if(v.is_boolean())return v.get<bool>()?"true":"false";if(v.is_number())return v.dump();return v.dump();}
+
+double jnum(const json& o,const char* key,double def=0.0);
+json runtime_layer(Database& db,const json& runtime);
 }
 
 App::App(Database&db,AnalysisEngine&engine,SourceSync&sync,std::string data_dir,bool safe_mode):db_(db),engine_(engine),sync_(sync),data_dir_(std::move(data_dir)),safe_mode_(safe_mode){state_path_=(fs::path(data_dir_)/"state.json").string();fs::create_directories(data_dir_);if(!safe_mode_)load_state();else{route_="health";runtime_["enabled"]=false;}uptime_start_=ImGui::GetTime();}
@@ -154,7 +157,7 @@ void App::render_sources(){title("SOURCE ARCHIVE // REVISION + HASH","Source Ver
 
 namespace {
 
-double jnum(const json& o,const char* key,double def=0.0){
+double jnum(const json& o,const char* key,double def){
     return o.is_object() && o.contains(key) && o[key].is_number() ? o[key].get<double>() : def;
 }
 
