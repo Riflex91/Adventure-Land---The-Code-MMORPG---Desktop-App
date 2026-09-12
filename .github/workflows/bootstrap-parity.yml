@@ -23,6 +23,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Repair the single transcription error in the temporary bootstrap transport.
+          sed -i 's/Z28NYzah3Ed/Z28NYwah3Ed/' .bootstrap/bundle.part05
           cat .bootstrap/bundle.part* > /tmp/native-parity.b64
           base64 --decode --ignore-garbage /tmp/native-parity.b64 > /tmp/native-parity.tar.gz
           tar -xzf /tmp/native-parity.tar.gz -C .
