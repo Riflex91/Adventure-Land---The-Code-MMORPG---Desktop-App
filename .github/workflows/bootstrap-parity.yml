@@ -24,7 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           cat .bootstrap/bundle.part* > /tmp/native-parity.b64
-          base64 -d /tmp/native-parity.b64 > /tmp/native-parity.tar.gz
+          base64 --decode --ignore-garbage /tmp/native-parity.b64 > /tmp/native-parity.tar.gz
           tar -xzf /tmp/native-parity.tar.gz -C .
           mkdir -p resources
           git config user.name "github-actions[bot]"
