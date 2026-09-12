@@ -11,6 +11,9 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace fs=std::filesystem;
 
@@ -29,12 +32,21 @@ fs::path default_data_dir(){
     return fs::current_path()/"AdventureLandReferenceOS-data";
 #endif
 }
+void report_error(const std::string& message){
+#ifdef _WIN32
+    MessageBoxA(nullptr,message.c_str(),"Adventure Land Reference OS",MB_OK|MB_ICONERROR|MB_TASKMODAL);
+#else
+    std::cerr<<message<<"\n";
+#endif
+}
 int db_total(const fs::path& p){Database d;std::string e;if(!d.open(p.string(),e,true))return 0;return d.total();}
 }
 
-int main(int argc,char** argv){
+int app_main(int argc,char** argv){
     try{
-        bool windowed=false,safe=false,reset_data=false;fs::path data_dir=default_data_dir();
+        const fs::path exe_dir=executable_dir(argv[0]);
+        bool windowed=false,safe=false,reset_data=false;
+        fs::path data_dir=fs::exists(exe_dir/"portable.flag")?(exe_dir/"data"):default_data_dir();
         for(int i=1;i<argc;i++){
             std::string a=argv[i];
             if(a=="--windowed")windowed=true;
@@ -43,10 +55,9 @@ int main(int argc,char** argv){
             else if(a=="--data-dir"&&i+1<argc)data_dir=argv[++i];
         }
         fs::create_directories(data_dir);
-        const fs::path exe_dir=executable_dir(argv[0]);
         const fs::path packaged_db=exe_dir/"resources"/"reference.db";
         const fs::path local_db=data_dir/"dataset.db";
-        if(!fs::exists(packaged_db)){std::cerr<<"Packaged database missing: "<<packaged_db<<"\n";return 2;}
+        if(!fs::exists(packaged_db)){report_error("Packaged database missing: "+packaged_db.string());return 2;}
         if(reset_data&&fs::exists(local_db)){std::error_code ec;fs::rename(local_db,data_dir/("dataset.pre-reset.db"),ec);if(ec)fs::remove(local_db,ec);}
         if(!fs::exists(local_db))fs::copy_file(packaged_db,local_db,fs::copy_options::overwrite_existing);
         else{
@@ -56,7 +67,7 @@ int main(int argc,char** argv){
             }
         }
 
-        if(!glfwInit()){std::cerr<<"GLFW init failed\n";return 3;}
+        if(!glfwInit()){report_error("GLFW init failed");return 3;}
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
 #ifdef __APPLE__
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT,GL_TRUE);
@@ -65,14 +76,14 @@ int main(int argc,char** argv){
         int width=vm?vm->width:1500,height=vm?vm->height:900;
         GLFWwindow* win=glfwCreateWindow(width,height,"Adventure Land Reference OS",monitor,nullptr);
         if(!win&&monitor){monitor=nullptr;win=glfwCreateWindow(1500,900,"Adventure Land Reference OS",nullptr,nullptr);}
-        if(!win){glfwTerminate();std::cerr<<"Could not create OpenGL window\n";return 4;}
+        if(!win){glfwTerminate();report_error("Could not create OpenGL window");return 4;}
         glfwMakeContextCurrent(win);glfwSwapInterval(1);
 
         IMGUI_CHECKVERSION();ImGui::CreateContext();ImGuiIO& io=ImGui::GetIO();io.ConfigFlags|=ImGuiConfigFlags_NavEnableKeyboard;io.IniFilename=nullptr;
         ImGui::StyleColorsDark();auto& style=ImGui::GetStyle();style.WindowRounding=0;style.ChildRounding=4;style.FrameRounding=4;style.ScrollbarRounding=4;style.WindowPadding=ImVec2(8,8);style.ItemSpacing=ImVec2(7,6);
         ImGui_ImplGlfw_InitForOpenGL(win,true);ImGui_ImplOpenGL3_Init("#version 330");
 
-        Database db;std::string error;if(!db.open(local_db.string(),error,false)){std::cerr<<"Database error: "<<error<<"\n";return 5;}
+        Database db;std::string error;if(!db.open(local_db.string(),error,false)){report_error("Database error: "+error);return 5;}
         AnalysisEngine engine(db);SourceSync sync;App app(db,engine,sync,data_dir.string(),safe);
 
         bool fullscreen=monitor!=nullptr;int wx=80,wy=80,ww=1500,wh=900;
@@ -88,5 +99,13 @@ int main(int argc,char** argv){
             ImGui::Render();int fw=0,fh=0;glfwGetFramebufferSize(win,&fw,&fh);glViewport(0,0,fw,fh);glClearColor(0.018f,0.035f,0.055f,1.0f);glClear(GL_COLOR_BUFFER_BIT);ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());glfwSwapBuffers(win);
         }
         ImGui_ImplOpenGL3_Shutdown();ImGui_ImplGlfw_Shutdown();ImGui::DestroyContext();glfwDestroyWindow(win);glfwTerminate();return 0;
-    }catch(const std::exception& e){std::cerr<<"Fatal: "<<e.what()<<"\n";return 1;}
+    }catch(const std::exception& e){report_error(std::string("Fatal: ")+e.what());return 1;}
 }
+
+#ifdef _WIN32
+extern int __argc;
+extern char** __argv;
+int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int){return app_main(__argc,__argv);}
+#else
+int main(int argc,char** argv){return app_main(argc,argv);}
+#endif
