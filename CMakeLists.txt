@@ -72,7 +72,13 @@ else()
   list(APPEND AL_APP_SOURCES src/http_linux.cpp)
 endif()
 
-add_executable(adventure-land-reference-os ${AL_APP_SOURCES})
+# WIN32 selects the Windows GUI subsystem, so launching the .exe does not open
+# a console window. Linux keeps the ordinary executable target.
+if(WIN32)
+  add_executable(adventure-land-reference-os WIN32 ${AL_APP_SOURCES})
+else()
+  add_executable(adventure-land-reference-os ${AL_APP_SOURCES})
+endif()
 target_include_directories(adventure-land-reference-os PRIVATE src)
 target_link_libraries(adventure-land-reference-os PRIVATE
   ${AL_SQLITE_TARGET}
