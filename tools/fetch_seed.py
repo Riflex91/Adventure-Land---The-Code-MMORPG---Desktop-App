@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import pathlib
 import sys
 import urllib.request
 
-DEFAULT_URL = "https://riflex91.bplaced.net/assets/adventure/reference/assets/data/seed.json"
+DEFAULT_URL = "http://riflex91.bplaced.net/assets/adventure/reference/assets/data/seed.json"
+DEFAULT_SHA256 = "594529988485782f9a8e3ee9382601fb600413b7c2dc56e2e86a8ccdbd75c981"
+
 url = os.environ.get("AL_SEED_URL", DEFAULT_URL)
+expected_sha256 = os.environ.get("AL_SEED_SHA256", DEFAULT_SHA256).strip().lower()
 out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "resources/seed.json")
 out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -16,6 +20,14 @@ try:
         payload = response.read()
 except Exception as exc:
     raise SystemExit(f"Failed to download seed from {url}: {exc}")
+
+actual_sha256 = hashlib.sha256(payload).hexdigest()
+if expected_sha256 and actual_sha256 != expected_sha256:
+    raise SystemExit(
+        "Seed integrity check failed: "
+        f"expected sha256={expected_sha256}, got sha256={actual_sha256}. "
+        "If the curated seed was intentionally updated, review it and update AL_SEED_SHA256/DEFAULT_SHA256."
+    )
 
 try:
     data = json.loads(payload.decode("utf-8"))
@@ -31,5 +43,6 @@ for section, minimum in required.items():
 
 out.write_bytes(payload)
 print(f"seed_url={url}")
+print(f"seed_sha256={actual_sha256}")
 print(f"seed_bytes={len(payload)}")
 print("counts=" + ", ".join(f"{k}:{len(data[k])}" for k in required))
