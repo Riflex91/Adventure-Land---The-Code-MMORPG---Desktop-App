@@ -1,4 +1,4 @@
-name: Bootstrap Native Parity
+name: Patch Native Parity
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  bootstrap:
+  patch:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -19,32 +19,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore native parity source bundle
+      - name: Fix runtime helper declaration order
         shell: bash
         run: |
           set -euo pipefail
-          sed -i 's/Z28NYzah3Ed/Z28NYwah3Ed/' .bootstrap/bundle.part05
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('.bootstrap/bundle.part06')
-          data=p.read_bytes()
-          if len(data) < 10000:
-              raise SystemExit(f'part06 too short: {len(data)}')
-          p.write_bytes(data[:10000])
+          p = Path('src/app.cpp')
+          text = p.read_text(encoding='utf-8')
+
+          marker = 'std::string flatten_scalar(const json&v){if(v.is_string())return v.get<std::string>();if(v.is_boolean())return v.get<bool>()?"true":"false";if(v.is_number())return v.dump();return v.dump();}\n}'
+          replacement = marker[:-1] + '\ndouble jnum(const json& o,const char* key,double def=0.0);\njson runtime_layer(Database& db,const json& runtime);\n}'
+          if 'double jnum(const json& o,const char* key,double def=0.0);' not in text:
+              if marker not in text:
+                  raise SystemExit('top helper marker not found')
+              text = text.replace(marker, replacement, 1)
+
+          definition = 'double jnum(const json& o,const char* key,double def=0.0){'
+          fixed = 'double jnum(const json& o,const char* key,double def){'
+          if definition in text:
+              text = text.replace(definition, fixed, 1)
+          elif fixed not in text:
+              raise SystemExit('jnum definition marker not found')
+
+          p.write_text(text, encoding='utf-8')
           PY
-          cat .bootstrap/bundle.part* > /tmp/native-parity.b64
-          base64 --decode /tmp/native-parity.b64 > /tmp/native-parity.tar.gz
-          tar -xzf /tmp/native-parity.tar.gz -C .
-          # GITHUB_TOKEN cannot update workflow files. Keep the currently-authorized
-          # workflow files here; ChatGPT updates build.yml separately after this push.
-          git checkout HEAD -- .github/workflows/build.yml .github/workflows/bootstrap-parity.yml
-          mkdir -p resources
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add src/app.cpp
           if git diff --cached --quiet; then
-            echo "No source changes to commit."
+            echo "No patch changes."
             exit 0
           fi
-          git commit -m "Port Reference OS feature parity to native C++23"
+          git commit -m "Fix native runtime helper declaration order"
           git push origin HEAD:main
