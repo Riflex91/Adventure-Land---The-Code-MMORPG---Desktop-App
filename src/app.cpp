@@ -1,98 +1,429 @@
 #include "app.hpp"
+#include "sha256.hpp"
+#include <imgui.h>
+#include <misc/cpp/imgui_stdlib.h>
+#include <sqlite3.h>
 #include <algorithm>
-#include <array>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <sstream>
+#include <thread>
+#include <ctime>
+#include <cstdlib>
+#include <cstring>
+#include <queue>
+#include <unordered_set>
+#include <stdexcept>
+
+using json=nlohmann::json;
+namespace fs=std::filesystem;
+namespace {
+const ImVec4 CYAN(0.23f,0.88f,0.83f,1),MUTED(0.55f,0.64f,0.72f,1),WARN(1.0f,0.68f,0.24f,1),BAD(1.0f,0.35f,0.35f,1),GOOD(0.35f,0.9f,0.55f,1),PURPLE(0.65f,0.55f,1,1);
+const char* DATA_SECTIONS[]={"items","monsters","skills","classes","maps","npcs","craft","sets","tokens","dismantle","conditions","quests","events"};
+const char* BUILD_SLOTS[]={"mainhand","offhand","helmet","chest","pants","shoes","gloves","cape","amulet","earring1","earring2","ring1","ring2","belt","orb"};
+std::string pretty_num(double v){std::ostringstream o;if(std::abs(v-std::round(v))<1e-9)o<<(long long)std::llround(v);else{o<<std::fixed<<std::setprecision(4)<<v;auto s=o.str();while(s.size()>1&&s.back()=='0')s.pop_back();if(s.back()=='.')s.pop_back();return s;}return o.str();}
+std::string human(std::string s){for(char&c:s)if(c=='_')c=' ';bool up=true;for(char&c:s){if(up&&std::isalpha((unsigned char)c)){c=(char)std::toupper((unsigned char)c);up=false;}else if(c==' ')up=true;}return s;}
+void title(const char* eyebrow,const std::string& h,const std::string& desc){ImGui::TextColored(CYAN,"%s",eyebrow);ImGui::SetWindowFontScale(1.35f);ImGui::TextUnformatted(h.c_str());ImGui::SetWindowFontScale(1.0f);ImGui::PushStyleColor(ImGuiCol_Text,MUTED);ImGui::TextWrapped("%s",desc.c_str());ImGui::PopStyleColor();ImGui::Separator();}
+void kv(const char* k,const std::string& v,const ImVec4& c=ImVec4(0.88f,0.92f,0.96f,1)){ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);ImGui::TextColored(MUTED,"%s",k);ImGui::TableSetColumnIndex(1);ImGui::TextColored(c,"%s",v.c_str());}
+void json_tree(const json& j,const std::string& label="raw",int depth=0){if(depth>6){ImGui::TextDisabled("...");return;}if(j.is_object()){for(auto it=j.begin();it!=j.end();++it){if(it.value().is_object()||it.value().is_array()){if(ImGui::TreeNode((label+"/"+it.key()).c_str(),"%s",it.key().c_str())){json_tree(it.value(),label+"/"+it.key(),depth+1);ImGui::TreePop();}}else{std::string v=it.value().is_string()?it.value().get<std::string>():it.value().dump();ImGui::TextColored(MUTED,"%s",it.key().c_str());ImGui::SameLine(180);ImGui::TextWrapped("%s",v.c_str());}}}else if(j.is_array()){for(size_t i=0;i<j.size()&&i<200;i++){std::string k=std::to_string(i);if(j[i].is_object()||j[i].is_array()){if(ImGui::TreeNode((label+"/"+k).c_str(),"[%zu]",i)){json_tree(j[i],label+"/"+k,depth+1);ImGui::TreePop();}}else ImGui::Text("[%zu] %s",i,j[i].dump().c_str());}}else ImGui::TextWrapped("%s",j.dump().c_str());}
+std::string now_stamp(){auto t=std::time(nullptr);std::tm tm{};
+#ifdef _WIN32
+localtime_s(&tm,&t);
+#else
+localtime_r(&t,&tm);
+#endif
+char b[32];std::strftime(b,sizeof(b),"%Y%m%d-%H%M%S",&tm);return b;}
+bool write_json(const fs::path&p,const json&j){std::ofstream f(p,std::ios::binary);if(!f)return false;f<<j.dump(2);return(bool)f;}
+json read_json(const fs::path&p){std::ifstream f(p,std::ios::binary);if(!f)return json();try{return json::parse(f);}catch(...){return json();}}
+std::string flatten_scalar(const json&v){if(v.is_string())return v.get<std::string>();if(v.is_boolean())return v.get<bool>()?"true":"false";if(v.is_number())return v.dump();return v.dump();}
+}
+
+App::App(Database&db,AnalysisEngine&engine,SourceSync&sync,std::string data_dir,bool safe_mode):db_(db),engine_(engine),sync_(sync),data_dir_(std::move(data_dir)),safe_mode_(safe_mode){state_path_=(fs::path(data_dir_)/"state.json").string();fs::create_directories(data_dir_);if(!safe_mode_)load_state();else{route_="health";runtime_["enabled"]=false;}uptime_start_=ImGui::GetTime();}
+
+std::string App::entity_key(const std::string&s,const std::string&i)const{return s+":"+i;}
+void App::push_error(std::string e){errors_.insert(errors_.begin(),std::move(e));if(errors_.size()>50)errors_.resize(50);}
+void App::clear_cache(){cache_.clear();}
+std::vector<Entity>& App::cached(const std::string& section){auto it=cache_.find(section);if(it==cache_.end())it=cache_.emplace(section,db_.all(section,100000)).first;return it->second;}
+void App::on_dataset_reloaded(){clear_cache();if(!selected_section_.empty()&&!db_.entity(selected_section_,selected_id_)){selected_section_.clear();selected_id_.clear();}}
+
+json App::serialize_state()const{json j;j["route"]=route_;j["selected"]={{"section",selected_section_},{"id",selected_id_}};j["favorites"]=favorites_;j["watchlist"]=watchlist_;j["runtime"]=runtime_;j["source_history"]=source_history_;j["last_diff"]=last_diff_;j["characters"]=characters_;j["workspaces"]=workspaces_;j["geometry"]=geometry_;j["recent"]=recent_entities_;auto bs=[](const BuildState&b){json x={{"class",b.class_id},{"level",b.level},{"slots",json::object()}};for(auto&[s,v]:b.slots)x["slots"][s]={{"id",v.first},{"level",v.second}};return x;};j["build_a"]=bs(build_a_);j["build_b"]=bs(build_b_);j["sel"]=sel_;return j;}
+void App::restore_state(const json&j){if(!j.is_object())return;route_=j.value("route","dashboard");selected_section_=j.value("selected",json::object()).value("section","");selected_id_=j.value("selected",json::object()).value("id","");if(j.contains("favorites")&&j["favorites"].is_array())for(auto&x:j["favorites"])if(x.is_string())favorites_.insert(x.get<std::string>());if(j.contains("watchlist")&&j["watchlist"].is_array())for(auto&x:j["watchlist"])if(x.is_string())watchlist_.insert(x.get<std::string>());runtime_=j.value("runtime",runtime_);source_history_=j.value("source_history",json::array());last_diff_=j.value("last_diff",json::array());characters_=j.value("characters",json::array());workspaces_=j.value("workspaces",json::array());geometry_=j.value("geometry",json::object());recent_entities_=j.value("recent",std::vector<std::string>{});if(j.contains("sel")&&j["sel"].is_object())sel_=j["sel"].get<std::unordered_map<std::string,std::string>>();auto loadb=[](const json&x,BuildState&b){if(!x.is_object())return;b.class_id=x.value("class","warrior");b.level=x.value("level",80);if(x.contains("slots")&&x["slots"].is_object())for(auto it=x["slots"].begin();it!=x["slots"].end();++it)b.slots[it.key()]={it.value().value("id",""),it.value().value("level",0)};};loadb(j.value("build_a",json::object()),build_a_);loadb(j.value("build_b",json::object()),build_b_);}
+void App::load_state(){restore_state(read_json(state_path_));}
+void App::save_state(){write_json(state_path_,serialize_state());}
+
+bool App::entity_combo(const char* label,const std::string& section,std::string& value,bool allow_empty){auto&rows=cached(section);std::string preview=value.empty()?"—":(db_.entity(section,value)?db_.entity(section,value)->name:value);bool changed=false;if(ImGui::BeginCombo(label,preview.c_str())){if(allow_empty&&ImGui::Selectable("—",value.empty())){value.clear();changed=true;}ImGuiListClipper clip;clip.Begin((int)rows.size());while(clip.Step())for(int i=clip.DisplayStart;i<clip.DisplayEnd;i++){auto&e=rows[i];bool sel=e.id==value;std::string l=e.name+"  //  "+e.id;if(ImGui::Selectable(l.c_str(),sel)){value=e.id;changed=true;}if(sel)ImGui::SetItemDefaultFocus();}ImGui::EndCombo();}return changed;}
+void App::select_entity(const std::string&s,const std::string&id){selected_section_=s;selected_id_=id;std::string k=entity_key(s,id);recent_entities_.erase(std::remove(recent_entities_.begin(),recent_entities_.end(),k),recent_entities_.end());recent_entities_.insert(recent_entities_.begin(),k);if(recent_entities_.size()>8)recent_entities_.resize(8);save_state();}
+
+void App::route_button(const char*icon,const char*label,const char*route,const char*badge){bool active=route_==route;ImGui::PushID(route);if(active)ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.08f,0.32f,0.36f,1));std::string text=std::string(icon)+"  "+label;if(badge&&*badge)text+="   ["+std::string(badge)+"]";if(ImGui::Button(text.c_str(),ImVec2(-1,34))){route_=route;save_state();}if(active)ImGui::PopStyleColor();ImGui::PopID();}
+
+void App::topbar(bool& request_fullscreen_toggle){ImGui::BeginChild("topbar",ImVec2(0,50),true,ImGuiWindowFlags_NoScrollbar);ImGui::TextColored(CYAN,"ADVENTURE LAND // NATIVE REFERENCE OS");ImGui::SameLine(300);ImGui::SetNextItemWidth(std::max(220.0f,ImGui::GetContentRegionAvail().x-520));if(focus_global_search_){ImGui::SetKeyboardFocusHere();focus_global_search_=false;}if(ImGui::InputTextWithHint("##global","Ctrl+K  Suche in allen Daten...",&global_search_,ImGuiInputTextFlags_EnterReturnsTrue)){sel_["search_query"]=global_search_;route_="searchLab";}ImGui::SameLine();if(sync_running_){int a=sync_done_.load(),b=std::max(1,sync_total_.load());ImGui::ProgressBar(float(a)/b,ImVec2(110,0));}else if(ImGui::Button("LIVE SYNC"))start_sync();ImGui::SameLine();if(ImGui::Button("F11"))request_fullscreen_toggle=true;ImGui::SameLine();ImGui::TextDisabled("%s",db_.meta("revision").empty()?"snapshot":db_.meta("revision").substr(0,12).c_str());ImGui::EndChild();}
+
+void App::sidebar(){ImGui::BeginChild("nav",ImVec2(250,0),true);ImGui::TextColored(MUTED,"DATEN");for(auto s:DATA_SECTIONS){std::string c=std::to_string(db_.count(s));route_button("[]",human(s).c_str(),s,c.c_str());}ImGui::Separator();ImGui::TextColored(MUTED,"RESEARCH");route_button("#","Uebersicht","dashboard");route_button("%","Exact Drops","dropsExplorer");route_button("^","Upgrade Lab","forge");route_button("C","Craft Graph","dependency");route_button("M","Monster Compare","compare");route_button("B","Build Designer","builds");route_button("$","Economy Lab","economy");route_button("F","Farm Calculator","farming");route_button("AB","Build Compare","buildCompare");route_button("S","Skill Simulator","skillsim");route_button("R","Spawn Routes","routes");route_button("A","Acquisition","acquisition");route_button("W","World / Spawns","world");route_button("@","Geometry Atlas","atlas");route_button("G","Knowledge Graph","graph");route_button("<>","Universal Compare","universalCompare");route_button("X","Combat Lab","combatLab");route_button("!","Integrity","integrity");route_button("V","Source Versions","sources");ImGui::Separator();ImGui::TextColored(MUTED,"WORKSPACE");route_button("*","Favoriten / Watch","favorites");route_button("D","Update Diff","changes");route_button("T","Runtime / Events","runtime");route_button("P","Character Import","characterImport");route_button("?","Advanced Search","searchLab");route_button("WS","Workspaces","workspaces");route_button("SC","Schema Explorer","schema");route_button("SS","Snapshots","snapshots");route_button("OK","Self Test","selftest");route_button("H","System Health","health");route_button("{}","Raw Data","raw");ImGui::EndChild();}
+
+void App::context_panel(){ImGui::BeginChild("context",ImVec2(360,0),true);ImGui::TextColored(CYAN,"ENTITY CONTEXT");if(selected_section_.empty()){ImGui::TextWrapped("Waehle ein Item, Monster, Skill, eine Map oder eine andere Entitaet. Der Kontext bleibt beim Werkzeugwechsel erhalten.");if(!recent_entities_.empty()){ImGui::SeparatorText("Zuletzt");for(auto&k:recent_entities_){auto p=k.find(':');if(p==std::string::npos)continue;std::string s=k.substr(0,p),id=k.substr(p+1);if(ImGui::SmallButton(k.c_str()))select_entity(s,id);}}ImGui::EndChild();return;}auto e=db_.entity(selected_section_,selected_id_);if(!e){selected_section_.clear();selected_id_.clear();ImGui::EndChild();return;}ImGui::TextDisabled("G.%s.%s",e->section.c_str(),e->id.c_str());ImGui::TextWrapped("%s",e->name.c_str());ImGui::TextColored(MUTED,"%s",e->description.c_str());std::string key=entity_key(e->section,e->id);bool fav=favorites_.count(key),wat=watchlist_.count(key);if(ImGui::Button(fav?"FAV ON":"FAVORIT")){if(fav)favorites_.erase(key);else favorites_.insert(key);save_state();}ImGui::SameLine();if(ImGui::Button(wat?"WATCH ON":"WATCH")){if(wat)watchlist_.erase(key);else watchlist_.insert(key);save_state();}if(ImGui::Button("COMPARE")){sel_["uc_section"]=e->section;sel_["uc_a"]=e->id;route_="universalCompare";}ImGui::SeparatorText("Felder");auto fs=db_.fields(e->section,e->id);if(ImGui::BeginTable("ctxfields",2,ImGuiTableFlags_RowBg|ImGuiTableFlags_SizingStretchProp)){ImGui::TableSetupColumn("Key",ImGuiTableColumnFlags_WidthFixed,135);ImGui::TableSetupColumn("Value");for(size_t i=0;i<fs.size()&&i<80;i++){ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);ImGui::TextDisabled("%s",fs[i].key.c_str());ImGui::TableSetColumnIndex(1);ImGui::TextWrapped("%s",fs[i].value.c_str());}ImGui::EndTable();}if(ImGui::TreeNode("RAW JSON")){auto j=db_.entity_json(e->section,e->id);json_tree(j,e->id);ImGui::TreePop();}ImGui::EndChild();}
+
+void App::frame(bool& request_fullscreen_toggle,bool& request_close){poll_sync();auto&io=ImGui::GetIO();if(ImGui::IsKeyChordPressed(ImGuiMod_Ctrl|ImGuiKey_K))command_open_=true;if(ImGui::IsKeyPressed(ImGuiKey_F11,false))request_fullscreen_toggle=true;if(ImGui::IsKeyChordPressed(ImGuiMod_Alt|ImGuiKey_LeftArrow)&&recent_entities_.size()>1){auto k=recent_entities_[1];auto p=k.find(':');if(p!=std::string::npos)select_entity(k.substr(0,p),k.substr(p+1));}ImGui::SetNextWindowPos(ImVec2(0,0));ImGui::SetNextWindowSize(io.DisplaySize);ImGui::Begin("##root",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoBringToFrontOnFocus);topbar(request_fullscreen_toggle);sidebar();ImGui::SameLine();float ctxw=io.DisplaySize.x>1100?360.0f:0.0f;ImGui::BeginChild("main",ImVec2(io.DisplaySize.x-250-ctxw-28,0),true);render_main();ImGui::EndChild();if(ctxw>0){ImGui::SameLine();context_panel();}ImGui::End();command_palette();(void)request_close;}
+
+void App::render_main(){if(route_=="dashboard")render_dashboard();else if(std::find(std::begin(DATA_SECTIONS),std::end(DATA_SECTIONS),route_)!=std::end(DATA_SECTIONS))render_browser(route_);else if(route_=="favorites")render_favorites();else if(route_=="changes")render_changes();else if(route_=="dropsExplorer")render_drop_engine();else if(route_=="forge")render_forge();else if(route_=="dependency")render_craft_graph();else if(route_=="compare")render_monster_compare();else if(route_=="builds")render_build_designer(build_a_,"BUILD DESIGNER");else if(route_=="economy")render_economy();else if(route_=="farming")render_farming();else if(route_=="buildCompare")render_build_compare();else if(route_=="skillsim")render_skill_sim();else if(route_=="routes")render_spawn_routes();else if(route_=="acquisition")render_acquisition();else if(route_=="world")render_world();else if(route_=="atlas")render_atlas();else if(route_=="graph")render_graph();else if(route_=="universalCompare")render_universal_compare();else if(route_=="combatLab")render_combat();else if(route_=="integrity")render_integrity();else if(route_=="sources")render_sources();else if(route_=="runtime")render_runtime();else if(route_=="characterImport")render_character_import();else if(route_=="searchLab")render_search_lab();else if(route_=="workspaces")render_workspaces();else if(route_=="schema")render_schema();else if(route_=="snapshots")render_snapshots();else if(route_=="selftest")render_selftest();else if(route_=="health")render_health();else if(route_=="raw")render_raw();else render_dashboard();}
+
+void App::render_dashboard(){title("NATIVE C++23 // SQLITE + QUICKJS","Adventure Land Reference OS","Native Research-Anwendung ohne Browser, PHP oder WebView. Alle Kernbereiche der Web-Version laufen lokal auf SQLite; LIVE SYNC wertet die offiziellen Adventure-Land-Definitionen in einer eingebetteten QuickJS-Sandbox aus.");if(ImGui::BeginTable("metrics",6,ImGuiTableFlags_Borders|ImGuiTableFlags_SizingStretchSame)){for(auto s:{"items","monsters","skills","classes","maps","npcs"}){ImGui::TableNextColumn();ImGui::TextColored(CYAN,"%d",db_.count(s));ImGui::TextDisabled("%s",human(s).c_str());}ImGui::EndTable();}ImGui::Spacing();ImGui::SeparatorText("Schnellzugriff");const std::pair<const char*,const char*> qs[]={{"dropsExplorer","Exact Drop Engine"},{"combatLab","Combat Lab"},{"world","World Atlas"},{"farming","Farm Calculator"},{"acquisition","Acquisition Graph"},{"integrity","Integrity Scanner"},{"searchLab","Advanced Search"},{"runtime","Runtime / Events"},{"sources","Source Versions"},{"snapshots","Offline Snapshots"},{"workspaces","Workspaces"},{"health","System Health"}};int i=0;for(auto&q:qs){if(i++%3)ImGui::SameLine();if(ImGui::Button(q.second,ImVec2(190,54)))route_=q.first;}ImGui::SeparatorText("Status");if(ImGui::BeginTable("status",2,ImGuiTableFlags_RowBg)){kv("Revision",db_.meta("revision"));kv("Repository",db_.meta("repository"));kv("Indexed entities",std::to_string(db_.total()));kv("Manifest SHA-256",db_.meta("manifest_sha256"));kv("Runtime layer",runtime_.value("enabled",false)?"ACTIVE":"OFF",runtime_.value("enabled",false)?WARN:GOOD);kv("Watchlist",std::to_string(watchlist_.size()));ImGui::EndTable();}}
+
+void App::render_browser(const std::string& section){std::string& q=sel_["browse_q:"+section],&kind=sel_["browse_kind:"+section];title(("G."+section+" // RAW + DERIVED").c_str(),human(section),"Volltextsuche, Typfilter, Rohdaten und persistenter Entity Context.");ImGui::SetNextItemWidth(300);ImGui::InputTextWithHint("##q","Suchen...",&q);auto rows=q.empty()?db_.all(section,100000):db_.query(section,q,100000);std::set<std::string> kinds;for(auto&e:cached(section))if(!e.kind.empty())kinds.insert(e.kind);if(!kinds.empty()){ImGui::SameLine();ImGui::SetNextItemWidth(180);if(ImGui::BeginCombo("##kind",kind.empty()?"Alle Typen":kind.c_str())){if(ImGui::Selectable("Alle Typen",kind.empty()))kind.clear();for(auto&k:kinds)if(ImGui::Selectable(k.c_str(),kind==k))kind=k;ImGui::EndCombo();}}if(!kind.empty())rows.erase(std::remove_if(rows.begin(),rows.end(),[&](auto&e){return e.kind!=kind;}),rows.end());ImGui::SameLine();ImGui::TextDisabled("%zu Treffer",rows.size());if(ImGui::BeginTable("entities",4,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerV|ImGuiTableFlags_ScrollY|ImGuiTableFlags_Resizable,ImVec2(0,-1))){ImGui::TableSetupScrollFreeze(0,1);ImGui::TableSetupColumn("ID",ImGuiTableColumnFlags_WidthFixed,160);ImGui::TableSetupColumn("Name",ImGuiTableColumnFlags_WidthStretch);ImGui::TableSetupColumn("Typ",ImGuiTableColumnFlags_WidthFixed,120);ImGui::TableSetupColumn("Beschreibung",ImGuiTableColumnFlags_WidthStretch);ImGui::TableHeadersRow();ImGuiListClipper clip;clip.Begin((int)rows.size());while(clip.Step())for(int i=clip.DisplayStart;i<clip.DisplayEnd;i++){auto&e=rows[i];ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);bool sel=e.section==selected_section_&&e.id==selected_id_;if(ImGui::Selectable(e.id.c_str(),sel,ImGuiSelectableFlags_SpanAllColumns))select_entity(e.section,e.id);ImGui::TableSetColumnIndex(1);ImGui::TextUnformatted(e.name.c_str());ImGui::TableSetColumnIndex(2);ImGui::TextColored(PURPLE,"%s",e.kind.c_str());ImGui::TableSetColumnIndex(3);ImGui::TextWrapped("%s",e.description.c_str());}ImGui::EndTable();}}
+
+void App::render_favorites(){title("LOCAL WORKSPACE // WATCHLIST","Favoriten & Watchlist","Persoenliche Referenzen bleiben lokal. Watchlist-Hits werden beim nativen LIVE SYNC gegen Record-Signaturen verglichen.");ImGui::Text("Favoriten: %zu   Watchlist: %zu",favorites_.size(),watchlist_.size());if(ImGui::BeginTable("fav",4,ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Flag");ImGui::TableSetupColumn("Section");ImGui::TableSetupColumn("ID");ImGui::TableSetupColumn("Name");ImGui::TableHeadersRow();std::set<std::string> all=favorites_;all.insert(watchlist_.begin(),watchlist_.end());for(auto&k:all){auto p=k.find(':');if(p==std::string::npos)continue;auto s=k.substr(0,p),id=k.substr(p+1);auto e=db_.entity(s,id);ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::Text("%s%s",favorites_.count(k)?"FAV":"",watchlist_.count(k)?" WATCH":"");ImGui::TableNextColumn();ImGui::TextUnformatted(s.c_str());ImGui::TableNextColumn();if(ImGui::Selectable(id.c_str()))select_entity(s,id);ImGui::TableNextColumn();ImGui::TextUnformatted(e?e->name.c_str():"missing");}ImGui::EndTable();}}
+
+void App::render_changes(){title("LIVE SYNC // RECORD DIFF","Update Diff","Vergleicht den Datensatz vor und nach dem letzten nativen LIVE SYNC auf Record-Signatur-Ebene.");if(last_diff_.empty()){ImGui::TextDisabled("Noch kein LIVE-SYNC-Diff vorhanden.");return;}int add=0,rem=0,ch=0,wat=0;for(auto&x:last_diff_){auto t=x.value("type","");if(t=="added")add++;else if(t=="removed")rem++;else ch++;if(watchlist_.count(x.value("key","")))wat++;}ImGui::TextColored(GOOD,"Added %d",add);ImGui::SameLine();ImGui::TextColored(WARN,"Changed %d",ch);ImGui::SameLine();ImGui::TextColored(BAD,"Removed %d",rem);ImGui::SameLine();ImGui::Text("Watch %d",wat);if(ImGui::BeginTable("diff",4,ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Type");ImGui::TableSetupColumn("Section");ImGui::TableSetupColumn("ID");ImGui::TableSetupColumn("Watch");ImGui::TableHeadersRow();for(auto&x:last_diff_){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(x.value("type","").c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(x.value("section","").c_str());ImGui::TableNextColumn();auto id=x.value("id","");if(ImGui::Selectable(id.c_str()))select_entity(x.value("section",""),id);ImGui::TableNextColumn();ImGui::TextUnformatted(watchlist_.count(x.value("key",""))?"WATCH":"");}ImGui::EndTable();}}
+
+void App::render_drop_engine(){
+    title("G.DROPS // SERVER SEMANTICS","Exact Drop Engine","Monster-/Map-/Global-Roots werden als direkte Faktoren behandelt. Rekursive open-Pools werden ueber die Summe ihrer Gewichte normalisiert; jeder Pfad bleibt auditierbar. Bei aktivem Runtime Layer werden dessen Drop-Mutationen verwendet.");
+    std::string&type=sel_["drop_type"],&source=sel_["drop_source"],&item=sel_["drop_item"];if(type.empty())type="monster";
+    const char* types[]={"monster","map","global","table"};if(ImGui::BeginCombo("Root type",type.c_str())){for(auto t:types)if(ImGui::Selectable(t,type==t)){type=t;source.clear();item.clear();}ImGui::EndCombo();}
+    json active=runtime_.value("enabled",false)?runtime_layer(db_,runtime_)["drops"]:db_.section_json("drops");
+    if(runtime_.value("enabled",false)){ImGui::SameLine();ImGui::TextColored(WARN,"RUNTIME ACTIVE");}
+    std::vector<std::string> sources;
+    if(type=="monster"&&active.contains("monsters")&&active["monsters"].is_object())for(auto it=active["monsters"].begin();it!=active["monsters"].end();++it)sources.push_back(it.key());
+    else if(type=="map"&&active.contains("maps")&&active["maps"].is_object())for(auto it=active["maps"].begin();it!=active["maps"].end();++it)if(it.key()!="global"&&it.key()!="global_static")sources.push_back(it.key());
+    else if(type=="global")sources={"global"};
+    else if(type=="table")for(auto it=active.begin();it!=active.end();++it)if(it.value().is_array())sources.push_back(it.key());
+    std::sort(sources.begin(),sources.end());if(source.empty()&&!sources.empty())source=sources.front();if(std::find(sources.begin(),sources.end(),source)==sources.end()&&!sources.empty())source=sources.front();
+    if(ImGui::BeginCombo("Source",source.c_str())){ImGuiListClipper clip;clip.Begin((int)sources.size());while(clip.Step())for(int i=clip.DisplayStart;i<clip.DisplayEnd;i++)if(ImGui::Selectable(sources[i].c_str(),source==sources[i])){source=sources[i];item.clear();}ImGui::EndCombo();}
+    static double mult=1.0;static int kills=1000;ImGui::InputDouble("Root multiplier",&mult,0.01,0.1,"%.4f");ImGui::InputInt("Kills",&kills);kills=std::max(1,kills);
+    auto rows=engine_.drop_paths_from(active,type,source,std::max(0.0,mult));std::set<std::string> items;for(auto&r:rows)if(r.kind=="item")items.insert(r.item);
+    if(ImGui::BeginCombo("Item filter",item.empty()?"Alle terminalen Drops":item.c_str())){if(ImGui::Selectable("Alle terminalen Drops",item.empty()))item.clear();for(auto&i:items)if(ImGui::Selectable(i.c_str(),item==i))item=i;ImGui::EndCombo();}
+    if(!item.empty()){auto a=engine_.aggregate_drop(rows,item);ImGui::Text("P/kill %.9f   Odds 1:%.2f   Expected units %.9f   P after %d = %.6f%%",a.per_kill,a.per_kill>0?1/a.per_kill:0,a.expected_units,kills,AnalysisEngine::probability_after(a.per_kill,kills)*100);}
+    if(ImGui::BeginTable("dropPaths",6,ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Kind");ImGui::TableSetupColumn("Item/Pool");ImGui::TableSetupColumn("Chance");ImGui::TableSetupColumn("1:N");ImGui::TableSetupColumn("Qty");ImGui::TableSetupColumn("Source path");ImGui::TableHeadersRow();for(auto&r:rows){if(!item.empty()&&r.item!=item)continue;if(r.kind=="pool")continue;ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(r.kind.c_str());ImGui::TableNextColumn();if(!r.item.empty()&&ImGui::Selectable(r.item.c_str()))select_entity("items",r.item);else if(r.item.empty())ImGui::TextUnformatted(r.pool.c_str());ImGui::TableNextColumn();ImGui::Text("%.9f%%",r.probability*100);ImGui::TableNextColumn();ImGui::Text("%.2f",r.probability>0?1/r.probability:0);ImGui::TableNextColumn();ImGui::Text("%g",r.quantity);ImGui::TableNextColumn();ImGui::TextWrapped("%s",r.path.c_str());}ImGui::EndTable();}
+}
+void App::render_forge(){title("UPGRADE / COMPOUND // PROBABILITY","Upgrade Lab","Projiziert die oeffentlichen Basiswahrscheinlichkeiten stufenweise. Scrolls, Offering, serverseitige Sonderfaelle und Item-spezifische Runtime bleiben explizite Szenariofaktoren.");std::string&item=sel_["forge_item"];entity_combo("Item","items",item);static int from=0,to=8;ImGui::InputInt("Start level",&from);ImGui::InputInt("Target level",&to);from=std::clamp(from,0,12);to=std::clamp(to,from+1,12);auto d=db_.entity_json("items",item);bool compound=d.contains("compound");int grade=0;if(d.contains("grades")&&d["grades"].is_array()){for(auto&g:d["grades"])if(g.is_number()&&from>=g.get<int>())grade++;grade=std::clamp(grade,0,2);}static const double U[3][13]={{0,.9999999,.98,.95,.7,.6,.4,.25,.15,.07,.024,.14,.11},{0,.99998,.97,.94,.68,.58,.38,.24,.14,.066,.018,.13,.10},{0,.97,.94,.92,.64,.52,.32,.232,.13,.062,.015,.12,.09}};static const double C[3][11]={{0,.99,.75,.40,.25,.20,.10,.08,.05,.05,.05},{0,.90,.70,.40,.20,.15,.08,.05,.05,.05,.03},{0,.80,.60,.32,.16,.10,.05,.03,.03,.03,.02}};double cumulative=1;ImGui::Text("Mode: %s   Grade bucket: %d",compound?"COMPOUND":"UPGRADE",grade);if(ImGui::BeginTable("forge",4,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg)){ImGui::TableSetupColumn("Step");ImGui::TableSetupColumn("Chance");ImGui::TableSetupColumn("Cumulative");ImGui::TableSetupColumn("Expected attempts");ImGui::TableHeadersRow();for(int l=from+1;l<=to;l++){double p=compound?C[grade][std::min(l,10)]:U[grade][std::min(l,12)];cumulative*=p;ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::Text("+%d",l);ImGui::TableNextColumn();ImGui::Text("%.4f%%",p*100);ImGui::TableNextColumn();ImGui::Text("%.8f%%",cumulative*100);ImGui::TableNextColumn();ImGui::Text("%.2f",p>0?1/p:0);}ImGui::EndTable();}ImGui::TextColored(WARN,"Cumulative success to +%d: %.10f%%",to,cumulative*100);if(!item.empty()&&ImGui::Button("Open item context"))select_entity("items",item);}
+
+void App::render_craft_graph(){title("G.CRAFT // RECURSIVE DEPENDENCY","Craft Dependency Graph","Rekursive Rezeptauflosung mit Mengen, Kosten und Zyklusmarkierung.");std::string&item=sel_["craft_item"];entity_combo("Output item","items",item);if(item.empty())return;auto tree=engine_.craft_tree(item,10);std::function<void(const json&,int)> draw=[&](const json&n,int depth){std::string line=std::string(depth*2,' ')+pretty_num(n.value("quantity",1.0))+"x "+n.value("name",n.value("id",""));if(n.value("cycle",false))line+=" [CYCLE]";if(n.contains("cost"))line+="  cost="+pretty_num(n["cost"].get<double>());ImGui::TextUnformatted(line.c_str());if(n.contains("ingredients")&&n["ingredients"].is_array())for(auto&x:n["ingredients"])draw(x,depth+1);};draw(tree,0);if(ImGui::TreeNode("Raw tree")){json_tree(tree,"craft");ImGui::TreePop();}}
+
+void App::render_monster_compare(){title("COMBAT ANALYTICS","Monster Compare","Bis zu vier Monster direkt nebeneinander: HP, Attack, Defense, Frequenz, Speed, XP und weitere Source-Felder.");for(int i=0;i<4;i++){std::string k="moncmp"+std::to_string(i);if(i)ImGui::SameLine();ImGui::SetNextItemWidth(190);entity_combo(("##m"+std::to_string(i)).c_str(),"monsters",sel_[k],i==3);}const char* fields[]={"hp","xp","attack","armor","resistance","speed","range","frequency","respawn","gold","aggro","rage","apiercing","rpiercing"};if(ImGui::BeginTable("mc",5,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Metric");for(int i=0;i<4;i++){auto e=db_.entity("monsters",sel_["moncmp"+std::to_string(i)]);ImGui::TableSetupColumn(e?e->name.c_str():("M"+std::to_string(i+1)).c_str());}ImGui::TableHeadersRow();for(auto f:fields){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(f);for(int i=0;i<4;i++){ImGui::TableNextColumn();auto j=db_.entity_json("monsters",sel_["moncmp"+std::to_string(i)]);if(j.contains(f))ImGui::TextUnformatted(flatten_scalar(j[f]).c_str());else ImGui::TextDisabled("-");}}ImGui::EndTable();}}
+
+void App::render_build_designer(BuildState&b,const char* heading,bool editable){title("EQUIPMENT // CLASS COMPATIBILITY",heading,"Klasse, Level und Equipment werden zu einem transparenten Stat-Modell aggregiert. Set-Boni werden aus G.sets abgeleitet.");entity_combo("Class","classes",b.class_id);ImGui::InputInt("Level",&b.level);b.level=std::clamp(b.level,1,200);for(auto slot:BUILD_SLOTS){auto&v=b.slots[slot];ImGui::PushID(slot);ImGui::SetNextItemWidth(270);entity_combo(slot,"items",v.first,true);ImGui::SameLine();ImGui::SetNextItemWidth(80);ImGui::InputInt("+lvl",&v.second);v.second=std::clamp(v.second,0,15);ImGui::PopID();}auto stats=engine_.build_stats(b.slots,b.class_id,b.level);ImGui::SeparatorText("Projected stats");if(ImGui::BeginTable("bstats",4,ImGuiTableFlags_RowBg|ImGuiTableFlags_Borders)){int col=0;for(auto&[k,v]:stats){ImGui::TableNextColumn();ImGui::TextColored(MUTED,"%s",k.c_str());ImGui::SameLine();ImGui::Text("%s",pretty_num(v).c_str());if(++col>80)break;}ImGui::EndTable();}if(editable&&ImGui::Button("Save build"))save_state();}
+
+void App::render_economy(){title("ECONOMY // SOURCE VALUES","Economy Lab","NPC-Basiswerte, Sell-Proxy, Token-/Craft-/Drop-Quellen und oeffentliche Item-Metadaten ohne Auction-House-Preise.");std::string&item=sel_["eco_item"];entity_combo("Item","items",item);auto d=db_.entity_json("items",item);double g=d.value("g",0.0);ImGui::Text("Base gold (G.items.%s.g): %s",item.c_str(),pretty_num(g).c_str());ImGui::Text("Sell proxy (60%%): %s",pretty_num(g*.6).c_str());auto a=engine_.acquisition(item);ImGui::SeparatorText("Sources");ImGui::Text("Monster drops: %zu",a["drops"].size());ImGui::Text("Craft definitions: %zu",a["craft"].size());ImGui::Text("Token sources: %zu",a["tokens"].size());ImGui::Text("NPC references: %zu",a["npcs"].size());if(ImGui::TreeNode("Acquisition raw")){json_tree(a,"eco");ImGui::TreePop();}}
+
+void App::render_farming(){
+    title("LOOT + XP // HOURLY MODEL","Farm Calculator","Explizites Kills-per-hour-Szenario fuer Gold, XP und Expected Drop Units. Ein aktiver Runtime Layer wird transparent in Drops/Monsterdaten einbezogen.");
+    std::string&m=sel_["farm_monster"];entity_combo("Monster","monsters",m);static double kph=120;ImGui::InputDouble("Kills / hour",&kph,10,100,"%.1f");kph=std::max(0.0,kph);
+    json layer=runtime_.value("enabled",false)?runtime_layer(db_,runtime_):json();json j=(layer.is_object()&&layer.contains("monsters")&&layer["monsters"].contains(m))?layer["monsters"][m]:db_.entity_json("monsters",m);double gold=jnum(j,"gold"),xp=jnum(j,"xp");
+    ImGui::Text("Gold/h: %s",pretty_num(gold*kph).c_str());ImGui::SameLine();ImGui::Text("XP/h: %s",pretty_num(xp*kph).c_str());if(runtime_.value("enabled",false)){ImGui::SameLine();ImGui::TextColored(WARN,"RUNTIME");}
+    auto paths=runtime_.value("enabled",false)?engine_.drop_paths_from(layer["drops"],"monster",m):engine_.drop_paths("monster",m);std::map<std::string,double> exp;for(auto&p:paths)if(p.kind=="item")exp[p.item]+=p.probability*p.quantity*kph;std::vector<std::pair<std::string,double>> v(exp.begin(),exp.end());std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.second>b.second;});
+    if(ImGui::BeginTable("farmdrops",3,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Item");ImGui::TableSetupColumn("Expected / h");ImGui::TableSetupColumn("Expected / kill");ImGui::TableHeadersRow();for(size_t i=0;i<v.size()&&i<250;i++){ImGui::TableNextRow();ImGui::TableNextColumn();if(ImGui::Selectable(v[i].first.c_str()))select_entity("items",v[i].first);ImGui::TableNextColumn();ImGui::Text("%.6f",v[i].second);ImGui::TableNextColumn();ImGui::Text("%.9f",kph>0?v[i].second/kph:0);}ImGui::EndTable();}
+}
+void App::render_build_compare(){title("BUILD A/B // DERIVED STATS","Character Build Compare","Zwei native Build-Zustaende mit identischem Aggregationsmodell vergleichen.");if(ImGui::Button("Edit Build A")){route_="builds";}ImGui::SameLine();if(ImGui::Button("Copy A -> B")){build_b_=build_a_;save_state();}ImGui::SeparatorText("Build B");render_build_designer(build_b_,"BUILD B",false);auto A=engine_.build_stats(build_a_.slots,build_a_.class_id,build_a_.level),B=engine_.build_stats(build_b_.slots,build_b_.class_id,build_b_.level);std::set<std::string> keys;for(auto&x:A)keys.insert(x.first);for(auto&x:B)keys.insert(x.first);if(ImGui::BeginTable("ab",4,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg)){ImGui::TableSetupColumn("Stat");ImGui::TableSetupColumn("A");ImGui::TableSetupColumn("B");ImGui::TableSetupColumn("Delta B-A");ImGui::TableHeadersRow();for(auto&k:keys){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(k.c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(pretty_num(A[k]).c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(pretty_num(B[k]).c_str());ImGui::TableNextColumn();double d=B[k]-A[k];ImGui::TextColored(d>0?GOOD:d<0?BAD:MUTED,"%s",pretty_num(d).c_str());}ImGui::EndTable();}}
+
+void App::render_skill_sim(){title("SKILL THROUGHPUT // DECLARED FIELDS","Skill DPS / Heal Simulator","Berechnet ausschliesslich deklarierte damage/heal-Multiplikatoren, Cooldown-Cap, Targets und MP-Durchsatz.");std::string&s=sel_["skill_sim"];entity_combo("Skill","skills",s);static double attack=1000,heal=1000,rate=1,targetMult=1;static int targets=1;ImGui::InputDouble("Base attack",&attack);ImGui::InputDouble("Base heal",&heal);ImGui::InputDouble("Cast attempts / sec",&rate);ImGui::InputInt("Targets",&targets);ImGui::InputDouble("Target damage multiplier",&targetMult,.05,.1,"%.3f");targets=std::max(1,targets);auto p=engine_.skill_projection(s,attack,heal,rate,targets,targetMult);if(ImGui::BeginTable("sk",2,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg)){kv("Cast rate",pretty_num(p.cast_rate)+" /s");kv("Damage / cast",pretty_num(p.damage_cast));kv("Damage / sec",pretty_num(p.damage_second));kv("Heal / cast",pretty_num(p.heal_cast));kv("Heal / sec",pretty_num(p.heal_second));kv("MP / sec",pretty_num(p.mp_second));ImGui::EndTable();}ImGui::TextColored(WARN,"Kein echter Combat-DPS: Armor, Crit, Conditions, Sonderlogik und Animation Locks sind hier absichtlich nicht eingerechnet.");}
+
+void App::render_spawn_routes(){title("G.MAPS // GEOMETRIC ROUTE","Spawn Route Planner","Nearest-neighbour-Route ueber bekannte Spawnzentren. Das ist eine geometrische Probe, kein smart_move()-Pathfinding.");std::string&m=sel_["route_map"];entity_combo("Map","maps",m);auto r=engine_.spawn_route(m);double total=0;if(ImGui::BeginTable("route",3,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg)){ImGui::TableSetupColumn("#");ImGui::TableSetupColumn("Spawn");ImGui::TableSetupColumn("Distance");ImGui::TableHeadersRow();for(size_t i=0;i<r.size();++i){total+=r[i].second;ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::Text("%zu",i+1);ImGui::TableNextColumn();ImGui::TextUnformatted(r[i].first.c_str());ImGui::TableNextColumn();ImGui::Text("%.2f",r[i].second);}ImGui::EndTable();}ImGui::Text("Total geometric distance: %.2f",total);}
+
+void App::render_acquisition(){title("REVERSE LOOKUP // ALL SOURCES","Item Acquisition Graph","Verfolgt ein Item rueckwaerts ueber Monster-Drops, Crafting, Token-Tabellen, NPC-Referenzen und Dismantling.");std::string&i=sel_["acq_item"];entity_combo("Item","items",i);auto a=engine_.acquisition(i);if(ImGui::Button("Open item context"))select_entity("items",i);for(auto key:{"drops","craft","tokens","npcs","dismantle"}){std::string h=human(key)+" ("+std::to_string(a[key].size())+")";if(ImGui::TreeNode(h.c_str())){json_tree(a[key],std::string("acq/")+key);ImGui::TreePop();}}}
+
+void App::render_world(){title("G.MAPS // TOPOLOGY + SPAWNS","World Atlas","Map-NPCs, Monster-Spawns, Doors und explizite on_death/on_exit-Topologie. Keine erfundene smart_move-Routenlogik.");std::string&m=sel_["world_map"],&target=sel_["world_target"];entity_combo("Map","maps",m);ImGui::SameLine();entity_combo("Route target","maps",target,true);auto w=engine_.world_summary(m);if(!target.empty()){auto p=engine_.map_route(m,target);ImGui::Text("Topology route: ");ImGui::SameLine();for(size_t i=0;i<p.size();++i){if(i)ImGui::SameLine();ImGui::TextColored(CYAN,"%s%s",i?"-> ":"",p[i].c_str());}}
+    auto mp=db_.entity_json("maps",m);std::vector<std::pair<ImVec2,std::string>> pts;double minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;if(mp.contains("monsters")&&mp["monsters"].is_array())for(auto&p:mp["monsters"]){double x=0,y=0;bool ok=false;if(p.contains("position")&&p["position"].is_array()&&p["position"].size()>=2){x=p["position"][0].get<double>();y=p["position"][1].get<double>();ok=true;}else if(p.contains("boundary")&&p["boundary"].is_array()&&p["boundary"].size()>=4){x=(p["boundary"][0].get<double>()+p["boundary"][2].get<double>())*.5;y=(p["boundary"][1].get<double>()+p["boundary"][3].get<double>())*.5;ok=true;}if(ok){pts.push_back({ImVec2((float)x,(float)y),p.value("type","monster")});minx=std::min(minx,x);maxx=std::max(maxx,x);miny=std::min(miny,y);maxy=std::max(maxy,y);}}if(mp.contains("npcs")&&mp["npcs"].is_array())for(auto&p:mp["npcs"]){if(p.contains("position")&&p["position"].is_array()&&p["position"].size()>=2){double x=p["position"][0].get<double>(),y=p["position"][1].get<double>();pts.push_back({ImVec2((float)x,(float)y),"NPC:"+p.value("id","")});minx=std::min(minx,x);maxx=std::max(maxx,x);miny=std::min(miny,y);maxy=std::max(maxy,y);}}
+    ImVec2 size(ImGui::GetContentRegionAvail().x,360);ImGui::InvisibleButton("atlasCanvas",size);ImDrawList* dl=ImGui::GetWindowDrawList();ImVec2 o=ImGui::GetItemRectMin();dl->AddRectFilled(o,ImVec2(o.x+size.x,o.y+size.y),IM_COL32(7,15,26,255));dl->AddRect(o,ImVec2(o.x+size.x,o.y+size.y),IM_COL32(40,90,110,255));if(!pts.empty()){double sx=(maxx-minx)>1?(size.x-40)/(maxx-minx):1,sy=(maxy-miny)>1?(size.y-40)/(maxy-miny):1;for(auto&[p,l]:pts){ImVec2 q(o.x+20+(p.x-minx)*sx,o.y+20+(p.y-miny)*sy);bool npc=l.rfind("NPC:",0)==0;dl->AddCircleFilled(q,4,npc?IM_COL32(165,139,255,255):IM_COL32(58,225,213,255));dl->AddText(ImVec2(q.x+6,q.y-7),IM_COL32(210,225,240,255),l.c_str());}}
+    if(ImGui::TreeNode("Map source data")){json_tree(w,"world");ImGui::TreePop();}}
+
+void App::render_graph(){title("CONNECTED KNOWLEDGE // RELATIONS","Knowledge Graph","Kompakte native Relationssicht. Waehle eine Entitaet im Context; Items zeigen Beschaffungsquellen, Monster ihre Drops und Maps ihre Topologie.");if(selected_section_.empty()){ImGui::TextDisabled("Bitte zuerst eine Entitaet auswaehlen.");return;}ImGui::TextColored(CYAN,"%s:%s",selected_section_.c_str(),selected_id_.c_str());if(selected_section_=="items"){auto a=engine_.acquisition(selected_id_);json_tree(a,"graph");}else if(selected_section_=="monsters"){auto p=engine_.drop_paths("monster",selected_id_);ImGui::Text("Drop paths: %zu",p.size());for(size_t i=0;i<p.size()&&i<200;i++)if(p[i].kind=="item")if(ImGui::Selectable((p[i].item+"  "+pretty_num(p[i].probability*100)+"%").c_str()))select_entity("items",p[i].item);}else if(selected_section_=="maps"){auto w=engine_.world_summary(selected_id_);json_tree(w,"graph");}else{auto j=db_.entity_json(selected_section_,selected_id_);json_tree(j,"graph");}}
+
+void App::render_universal_compare(){title("FIELD DIFF // SAME SECTION","Universal Compare","Vergleicht zwei Entitaeten derselben G.*-Sektion feldweise. Identische Werte koennen ausgeblendet werden.");std::string&sec=sel_["uc_section"],&a=sel_["uc_a"],&b=sel_["uc_b"];if(sec.empty())sec="items";if(ImGui::BeginCombo("Section",sec.c_str())){for(auto s:DATA_SECTIONS)if(ImGui::Selectable(s,sec==s)){sec=s;a.clear();b.clear();}ImGui::EndCombo();}entity_combo("A",sec,a);entity_combo("B",sec,b);static bool hide=true;ImGui::Checkbox("Hide identical",&hide);auto A=db_.entity_json(sec,a),B=db_.entity_json(sec,b);std::set<std::string> keys;if(A.is_object())for(auto it=A.begin();it!=A.end();++it)keys.insert(it.key());if(B.is_object())for(auto it=B.begin();it!=B.end();++it)keys.insert(it.key());if(ImGui::BeginTable("uc",3,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Field");ImGui::TableSetupColumn("A");ImGui::TableSetupColumn("B");ImGui::TableHeadersRow();for(auto&k:keys){json va=A.contains(k)?A[k]:json(),vb=B.contains(k)?B[k]:json();if(hide&&va==vb)continue;ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(k.c_str());ImGui::TableNextColumn();ImGui::TextWrapped("%s",flatten_scalar(va).c_str());ImGui::TableNextColumn();ImGui::TextWrapped("%s",flatten_scalar(vb).c_str());}ImGui::EndTable();}}
+
+void App::render_combat(){
+    title("CHARACTER + COMBAT // DEFENSE + SUSTAIN","Character / Combat Lab 2.0","Build-/Observed-Stats gegen ein Zielmonster. Defense nutzt damage_multiplier(defense); V11.1-Sustain, Multi-Target, Evasion-Szenario und Character-Import sind explizit modelliert.");
+    std::string&m=sel_["combat_monster"],&skill=sel_["combat_skill"];entity_combo("Monster","monsters",m);entity_combo("Optional damage/heal skill","skills",skill,true);
+    static bool manual=false,applyEvasion=false;ImGui::Checkbox("Observed override",&manual);ImGui::SameLine();ImGui::Checkbox("Apply monster evasion",&applyEvasion);
+    auto stats=engine_.build_stats(build_a_.slots,build_a_.class_id,build_a_.level);static double attack=1000,hp=4000,armor=0,res=0,ap=0,rp=0,freq=1,crit=0,output=100,mpRegen=0,hpRegen=0,lifesteal=0,manasteal=0,reflection=0,heal=0;std::string dtype="physical";
+    json activeChar;std::string activeId=sel_["active_character"];for(auto&c:characters_)if(c.value("id","")==activeId){activeChar=c;break;}
+    if(!manual){attack=stats["attack"];hp=stats["hp"];armor=stats["armor"];res=stats["resistance"];ap=stats["apiercing"];rp=stats["rpiercing"];freq=stats["frequency"];crit=stats["crit"];output=stats.count("output")?stats["output"]:100;auto cls=db_.entity_json("classes",build_a_.class_id);dtype=cls.value("damage_type","physical");}
+    if(!activeChar.empty()&&ImGui::Button("USE IMPORTED OBSERVED STATS")){auto st=activeChar.value("stats",json::object());auto pull=[&](const char*k,double&v){if(st.contains(k)&&st[k].is_number())v=st[k].get<double>();};pull("attack",attack);pull("hp",hp);pull("max_hp",hp);pull("armor",armor);pull("resistance",res);pull("apiercing",ap);pull("rpiercing",rp);pull("frequency",freq);pull("crit",crit);pull("output",output);pull("mp_regen",mpRegen);pull("hp_regen",hpRegen);pull("lifesteal",lifesteal);pull("manasteal",manasteal);pull("reflection",reflection);pull("heal",heal);manual=true;}
+    if(manual){ImGui::InputDouble("Attack",&attack);ImGui::InputDouble("HP",&hp);ImGui::InputDouble("Armor",&armor);ImGui::InputDouble("Resistance",&res);ImGui::InputDouble("APiercing",&ap);ImGui::InputDouble("RPiercing",&rp);ImGui::InputDouble("Frequency",&freq);ImGui::InputDouble("Crit %",&crit);ImGui::InputDouble("Output %",&output);std::string&dt=sel_["combat_dtype"];if(dt.empty())dt="physical";dtype=dt;if(ImGui::BeginCombo("Damage type",dt.c_str())){for(auto x:{"physical","magical","pure"})if(ImGui::Selectable(x,dt==x))dt=x;ImGui::EndCombo();}}
+    ImGui::SeparatorText("Sustain / Combat 2.0 inputs");ImGui::InputDouble("HP regen / sec",&hpRegen);ImGui::SameLine();ImGui::InputDouble("MP regen / sec",&mpRegen);ImGui::InputDouble("Lifesteal %",&lifesteal);ImGui::SameLine();ImGui::InputDouble("Manasteal %",&manasteal);ImGui::InputDouble("Reflection %",&reflection);ImGui::SameLine();ImGui::InputDouble("Heal power",&heal);
+    static double critBonus=100;ImGui::InputDouble("Crit bonus %",&critBonus);
+    std::map<std::string,double> ch={{"attack",attack},{"hp",hp},{"armor",armor},{"resistance",res},{"apiercing",ap},{"rpiercing",rp},{"frequency",freq},{"crit",crit},{"output",output}};
+    json layer=runtime_.value("enabled",false)?runtime_layer(db_,runtime_):json();json monster=(layer.is_object()&&layer.contains("monsters")&&layer["monsters"].contains(m))?layer["monsters"][m]:db_.entity_json("monsters",m);auto r=engine_.combat_with_monster(ch,dtype,monster,skill,critBonus);
+    auto sd=db_.entity_json("skills",skill);double targets=std::max(1.0,jnum(sd,"targets",jnum(sd,"target_count",1)));double hitChance=applyEvasion?std::clamp(1.0-jnum(monster,"evasion")/100.0,.05,1.0):1.0;double totalTargetDps=(r.basic_dps+(r.skill_dps*targets))*hitChance;double lifeHps=totalTargetDps*std::max(0.0,lifesteal)/100.0;double manaMps=totalTargetDps*std::max(0.0,manasteal)/100.0;double incomingNet=std::max(0.0,r.incoming_dps-std::max(0.0,hpRegen));double reflectDps=r.incoming_dps*std::max(0.0,reflection)/100.0;double mpNet=mpRegen+manaMps-r.mp_per_second;double healRaw=sd.contains("heal_multiplier")&&sd["heal_multiplier"].is_number()?heal*sd["heal_multiplier"].get<double>():jnum(sd,"heal");double healRate=jnum(sd,"cooldown")>0?1000.0/jnum(sd,"cooldown"):0;double healPerSec=healRaw*healRate*targets;double ttk=totalTargetDps>0?jnum(monster,"hp")/totalTargetDps:std::numeric_limits<double>::infinity();double ttd=incomingNet>0?hp/incomingNet:std::numeric_limits<double>::infinity();double margin=std::isfinite(ttk)&&ttk>0?ttd/ttk:std::numeric_limits<double>::infinity();
+    if(ImGui::BeginTable("combatres",2,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg)){kv("Target defense",pretty_num(r.target_defense));kv("Outgoing multiplier",pretty_num(r.out_multiplier));kv("Hit chance scenario",pretty_num(hitChance*100)+"%");kv("Basic DPS",pretty_num(r.basic_dps));kv("Skill targets",pretty_num(targets));kv("Total modeled DPS",pretty_num(totalTargetDps),CYAN);kv("Incoming DPS",pretty_num(r.incoming_dps));kv("Incoming net after regen",pretty_num(incomingNet));kv("Lifesteal HPS",pretty_num(lifeHps));kv("Skill heal / sec",pretty_num(healPerSec));kv("Manasteal MP/s",pretty_num(manaMps));kv("MP net / sec",pretty_num(mpNet),mpNet>=0?GOOD:WARN);kv("Reflection DPS",pretty_num(reflectDps));kv("TTK",std::isfinite(ttk)?pretty_num(ttk)+" s":"inf");kv("Time to zero HP",std::isfinite(ttd)?pretty_num(ttd)+" s":"inf");kv("Survival/kill margin",std::isfinite(margin)?pretty_num(margin)+"x":"inf",margin>=1?GOOD:BAD);ImGui::EndTable();}
+    if(runtime_.value("enabled",false))ImGui::TextColored(WARN,"Runtime Layer ACTIVE: Monster-Mutationen werden verwendet.");ImGui::TextColored(WARN,"Combat-Scope: Projektile, Conditions, Animation Lock, Server-Sonderlogik und weitere Skill-spezifische Regeln koennen echte Kaempfe veraendern.");
+}
+void App::render_integrity(){title("DATA CONTRACT // CROSS REFERENCES","Data Integrity Scanner","Prueft Drops, Crafting, Sets, Klassen, Skills, Maps, NPCs und referenzielle Struktur.");static std::vector<IntegrityIssue> issues;static bool ready=false;if(ImGui::Button("RUN SCAN")||!ready){issues=engine_.integrity_scan();ready=true;}int err=0,warn=0;for(auto&i:issues){if(i.severity=="error")err++;else warn++;}ImGui::TextColored(err?BAD:GOOD,"Errors %d",err);ImGui::SameLine();ImGui::TextColored(warn?WARN:GOOD,"Warnings %d",warn);if(ImGui::BeginTable("issues",5,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Severity",ImGuiTableColumnFlags_WidthFixed,75);ImGui::TableSetupColumn("Code",ImGuiTableColumnFlags_WidthFixed,150);ImGui::TableSetupColumn("Entity",ImGuiTableColumnFlags_WidthFixed,180);ImGui::TableSetupColumn("Message");ImGui::TableSetupColumn("Path");ImGui::TableHeadersRow();for(auto&i:issues){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextColored(i.severity=="error"?BAD:WARN,"%s",i.severity.c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(i.code.c_str());ImGui::TableNextColumn();std::string e=i.section+":"+i.id;if(ImGui::Selectable(e.c_str())&&!i.id.empty())select_entity(i.section,i.id);ImGui::TableNextColumn();ImGui::TextWrapped("%s",i.message.c_str());ImGui::TableNextColumn();ImGui::TextWrapped("%s",i.path.c_str());}ImGui::EndTable();}}
+
+void App::render_sources(){title("SOURCE ARCHIVE // REVISION + HASH","Source Versions","LIVE SYNC laedt ausschliesslich die fest eingebaute Adventure-Land-GitHub-Allowlist, pinnt wenn moeglich auf einen Commit und archiviert den normalisierten Snapshot lokal.");if(sync_running_){std::lock_guard<std::mutex>g(sync_mu_);ImGui::Text("Sync: %s",sync_label_.c_str());}else if(ImGui::Button("LIVE SYNC + ARCHIVE"))start_sync();ImGui::Text("Current revision: %s",db_.meta("revision").c_str());ImGui::Text("Manifest SHA-256: %s",db_.meta("manifest_sha256").c_str());if(ImGui::BeginTable("srcs",4,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Revision");ImGui::TableSetupColumn("Date");ImGui::TableSetupColumn("Files");ImGui::TableSetupColumn("Actions");ImGui::TableHeadersRow();for(size_t i=0;i<source_history_.size();++i){auto&v=source_history_[i];ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(v.value("revision","").substr(0,12).c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(v.value("date","").c_str());ImGui::TableNextColumn();ImGui::Text("%d",v.value("files",0));ImGui::TableNextColumn();ImGui::PushID((int)i);if(ImGui::SmallButton("RESTORE"))restore_snapshot_file(v.value("archive",""));ImGui::PopID();}ImGui::EndTable();}}
 
 namespace {
-constexpr Color BG{7,14,25}, PANEL{10,22,37}, PANEL2{13,28,47}, BORDER{31,66,88}, TEXT{220,232,243}, MUTED{132,155,177}, CYAN{58,225,213}, PURPLE{165,139,255}, WHITE{245,249,255}, RED{255,104,104};
-struct Nav { const char* key; const char* label; const char* icon; };
-constexpr std::array<Nav,6> NAV{{
- {"","Dashboard","#"},{"items","Items","I"},{"monsters","Monster","M"},{"skills","Skills","S"},{"classes","Klassen","C"},{"maps","Maps","W"}
-}};
-std::string upper(std::string s){for(char& c:s)c=(char)std::toupper((unsigned char)c);return s;}
+
+double jnum(const json& o,const char* key,double def=0.0){
+    return o.is_object() && o.contains(key) && o[key].is_number() ? o[key].get<double>() : def;
 }
 
-void App::refresh(){ rows_=db_.query(section_,search_); selected_=rows_.empty()?-1:std::clamp(selected_,0,(int)rows_.size()-1); scroll_=std::max(0,scroll_); dirty_=false; }
-
-void App::frame(const InputState& in){
-    if(in.f11) p_.toggle_fullscreen();
-    if(in.escape && !search_.empty()){search_.clear();dirty_=true;}
-    if(in.backspace && !search_.empty()){search_.pop_back();dirty_=true;}
-    if(!in.text.empty()){ for(unsigned char c:in.text) if(c>=32 && c!=127){ search_.push_back((char)c); dirty_=true; } }
-    if(dirty_)refresh();
-    p_.clear(BG);
-    const int top=54, side=205, inspect=std::max(300,p_.width()/4);
-    p_.fill({0,0,p_.width(),top},PANEL); p_.stroke({0,top-1,p_.width(),1},BORDER);
-    p_.text(18,20,p_.width()<1050?"AL // REF OS":"ADVENTURE LAND // REF OS DESKTOP",CYAN,true);
-    p_.text(p_.width()-280,20,p_.fullscreen()?"F11  FULLSCREEN // ON":"F11  FULLSCREEN",MUTED,false);
-    const int search_x=std::max(side+18,330);
-    Rect sr{search_x,10,std::max(200,p_.width()-search_x-inspect-30),34}; p_.fill(sr,PANEL2);p_.stroke(sr,BORDER);
-    p_.text(sr.x+12,sr.y+11,search_.empty()?"Search items, monsters, skills ...":search_,search_.empty()?MUTED:TEXT,false);
-    sidebar(in,0,top,side,p_.height()-top);
-    if(section_.empty()) dashboard(side,top,p_.width()-side,p_.height()-top);
-    else {
-        content(in,side,top,p_.width()-side-inspect,p_.height()-top);
-        inspector(p_.width()-inspect,top,inspect,p_.height()-top);
+json runtime_layer(Database& db,const json& runtime){
+    json drops=db.section_json("drops");
+    json monsters=db.section_json("monsters");
+    json changes=json::array();
+    auto change=[&](const std::string& path,const json& before,const json& after){changes.push_back({{"path",path},{"before",before},{"after",after}});};
+    auto modify_rows=[](json& rows,const std::function<double(double)>& fn){
+        if(!rows.is_array())return;
+        for(auto& row:rows)if(row.is_array()&&!row.empty()&&row[0].is_number())row[0]=fn(row[0].get<double>());
+    };
+    const std::string mode=runtime.value("mode","normal");
+    if(mode=="hardcore"){
+        if(drops.contains("monsters")&&drops["monsters"].is_object()){
+            for(auto it=drops["monsters"].begin();it!=drops["monsters"].end();++it){
+                modify_rows(it.value(),[](double p){double n=p*200.0;if(n<.0001)n*=12.0;return std::min(1.0,n);});
+                if(it.value().is_array()){it.value().push_back(json::array({.01,"glitch"}));it.value().push_back(json::array({.01,"glitch"}));it.value().push_back(json::array({.001,"glitch"}));}
+            }
+        }
+        if(drops.is_object()){
+            for(auto it=drops.begin();it!=drops.end();++it){
+                if(!it.value().is_array())continue;
+                double total=0;int n=0;
+                for(auto& row:it.value())if(row.is_array()&&!row.empty()&&row[0].is_number()){total+=row[0].get<double>();n++;}
+                const double avg=n?total/n:0;
+                modify_rows(it.value(),[avg](double p){double x=p;if(x<.001)x*=200;if(x*3<avg)x*=12;else if(x*1.5<avg)x*=3;else if(x/3>avg)x/=12;else if(x/1.5>avg)x/=3;return x;});
+            }
+        }
+        if(drops.contains("maps")&&drops["maps"].is_object()){
+            for(auto it=drops["maps"].begin();it!=drops["maps"].end();++it)if(it.value().is_array())modify_rows(it.value(),[](double p){return std::min(1.0,p*200.0);});
+            auto& mansion=drops["maps"]["mansion"];if(!mansion.is_array())mansion=json::array();mansion.push_back(json::array({.001,"lostearring"}));mansion.push_back(json::array({.001,"lostearring"}));
+            drops["maps"]["global"]=json::array();
+        }
+        auto& gem0=drops["gem0"];if(!gem0.is_array())gem0=json::array();gem0.push_back(json::array({.5,"candycane"}));gem0.push_back(json::array({.05,"basketofeggs"}));
+        const json adds={{"iceroamer",json::array({json::array({.1,"open","statbelt"})})},{"arcticbee",json::array({json::array({.00001,"fclaw"})})},{"minimush",json::array({json::array({.00001,"throwingstars"})})},{"squig",json::array({json::array({.000008,"glitch"})})},{"bbpompom",json::array({json::array({.00008,"glitch"})})},{"croc",json::array({json::array({.000008,"glitch"}),json::array({1,"seashell"}),json::array({1,"seashell"})})},{"mole",json::array({json::array({.002,"gemfragment"}),json::array({.002,"gemfragment"})})}};
+        if(!drops.contains("monsters")||!drops["monsters"].is_object())drops["monsters"]=json::object();
+        for(auto it=adds.begin();it!=adds.end();++it){auto& rows=drops["monsters"][it.key()];if(!rows.is_array())rows=json::array();for(auto&r:it.value())rows.push_back(r);}
+        change("runtime.mode","normal","hardcore");
     }
-    p_.present();
-}
-
-void App::sidebar(const InputState& in,int x,int y,int w,int h){
-    p_.fill({x,y,w,h},PANEL);p_.stroke({w-1,y,1,h},BORDER);
-    int yy=y+14;
-    for(auto& n:NAV){
-        Rect r{x+10,yy,w-20,42}; bool active=section_==n.key;
-        if(active){p_.fill(r,PANEL2);p_.stroke(r,CYAN);} 
-        p_.fill({r.x+8,r.y+7,28,28},active?Color{16,54,66}:Color{14,34,50});
-        p_.text(r.x+18,r.y+17,n.icon,active?CYAN:MUTED,true);
-        p_.text(r.x+48,r.y+15,n.label,active?WHITE:TEXT,active);
-        if(n.key[0]){auto c=std::to_string(db_.count(n.key));p_.text(r.x+r.w-p_.text_width(c)-10,r.y+15,c,MUTED,false);}
-        if(in.mouse_clicked && r.contains(in.mouse_x,in.mouse_y)){section_=n.key;selected_=-1;scroll_=0;dirty_=true;}
-        yy+=48;
+    if(runtime.value("pvp",false)){
+        if(!drops.contains("maps")||!drops["maps"].is_object())drops["maps"]=json::object();
+        auto& g=drops["maps"]["global_static"];if(!g.is_array())g=json::array();g.push_back(json::array({1.0/(mode=="hardcore"?1000.0:100000.0),"pvptoken"}));
+        change("drops.maps.global_static","base","+pvptoken");
     }
-    p_.text(18,y+h-58,"NATIVE C++23",CYAN,true);p_.text(18,y+h-38,"SQLite FTS5 // X11/Win32",MUTED,false);p_.text(18,y+h-20,"No Chromium. No PHP.",MUTED,false);
-}
-
-void App::dashboard(int x,int y,int w,int h){
-    p_.fill({x,y,w,h},BG); int xx=x+42, yy=y+42;
-    p_.text(xx,yy,"NATIVE DESKTOP CORE",CYAN,true); yy+=42;
-    p_.text(xx,yy,"Adventure Land as a fast local research tool.",WHITE,true); yy+=28;
-    p_.text(xx,yy,"Current build reads a pre-indexed SQLite snapshot and renders only visible rows.",MUTED,false); yy+=50;
-    const char* keys[]={"items","monsters","skills","classes","maps"}; const char* labels[]={"ITEMS","MONSTERS","SKILLS","CLASSES","MAPS"};
-    for(int i=0;i<5;i++){
-        int cw=180,ch=86,cx=xx+(i%3)*(cw+14),cy=yy+(i/3)*(ch+14);p_.fill({cx,cy,cw,ch},PANEL);p_.stroke({cx,cy,cw,ch},BORDER);
-        p_.text(cx+16,cy+20,std::to_string(db_.count(keys[i])),i%2?CYAN:PURPLE,true);p_.text(cx+16,cy+52,labels[i],MUTED,true);
+    if(!drops.contains("maps")||!drops["maps"].is_object())drops["maps"]=json::object();
+    auto& global=drops["maps"]["global"];if(!global.is_array())global=json::array();
+    const json events=runtime.value("events",json::object());
+    auto enabled=[&](const char* k){return events.value(k,false);};
+    if(enabled("halloween")){
+        global.push_back(json::array({.00005,"candy0"}));global.push_back(json::array({.00125,"candy1"}));
+        for(const char* id:{"jr","greenjr"})if(monsters.contains(id)&&monsters[id].is_object()){json before=monsters[id].value("respawn",0);monsters[id]["respawn"]=480;change(std::string("monsters.")+id+".respawn",before,480);}
     }
-    int sy=yy+210;p_.text(xx,sy,"SPEED DESIGN",CYAN,true);sy+=28;
-    p_.text(xx,sy,"- SQLite FTS5 search index",TEXT,false);sy+=22;p_.text(xx,sy,"- virtualized entity rows",TEXT,false);sy+=22;p_.text(xx,sy,"- immediate native drawing",TEXT,false);sy+=22;p_.text(xx,sy,"- F11 native fullscreen",TEXT,false);
+    if(enabled("holidayseason")){global.push_back(json::array({.0006,"ornament"}));global.push_back(json::array({.0018,"mistletoe"}));global.push_back(json::array({.0005,"candycane"}));global.push_back(json::array({.0001,"open","xN"}));global.push_back(json::array({.00000001,"orbofsc"}));}
+    if(enabled("lunarnewyear")){global.push_back(json::array({.00005,"brownenvelope"}));global.push_back(json::array({.000000005,"5bucks"}));}
+    if(enabled("valentines"))global.push_back(json::array({.001,"candypop"}));
+    if(enabled("egghunt")){global.push_back(json::array({.000005,"goldenegg"}));global.push_back(json::array({.009,"open","eastereggs"}));}
+    for(auto it=events.begin();it!=events.end();++it)if(it.value().is_boolean()&&it.value().get<bool>())change("event."+it.key(),false,true);
+    return {{"drops",drops},{"monsters",monsters},{"changes",changes}};
 }
 
-void App::content(const InputState& in,int x,int y,int w,int h){
-    p_.fill({x,y,w,h},BG);p_.stroke({x+w-1,y,1,h},BORDER);
-    const int rowh=48, header=54; int visible=std::max(1,(h-header)/rowh);
-    scroll_=std::clamp(scroll_-in.wheel*3,0,std::max(0,(int)rows_.size()-visible));
-    p_.text(x+18,y+18,upper(section_),WHITE,true);std::string meta=std::to_string(rows_.size())+" RESULTS";p_.text(x+w-p_.text_width(meta)-18,y+18,meta,MUTED,false);
-    int yy=y+header;
-    for(int i=0;i<visible && scroll_+i<(int)rows_.size();++i){int idx=scroll_+i;auto& e=rows_[idx];Rect r{x+8,yy+i*rowh,w-16,rowh-2};
-        if(idx==selected_)p_.fill(r,PANEL2); else if(i%2)p_.fill(r,Color{8,18,30});
-        if(idx==selected_)p_.stroke(r,CYAN);
-        p_.text(r.x+12,r.y+10,e.name,idx==selected_?WHITE:TEXT,idx==selected_);p_.text(r.x+12,r.y+28,e.id,MUTED,false);
-        if(!e.kind.empty())p_.text(r.x+r.w-p_.text_width(e.kind)-12,r.y+18,e.kind,PURPLE,false);
-        if(in.mouse_clicked && r.contains(in.mouse_x,in.mouse_y))selected_=idx;
+json sanitize_character(const json& input){
+    json out=json::object();
+    auto copy_string=[&](const char* k){if(input.contains(k)&&input[k].is_string())out[k]=input[k].get<std::string>().substr(0,160);};
+    auto copy_number=[&](const char* k){if(input.contains(k)&&input[k].is_number())out[k]=input[k];};
+    copy_string("name");copy_string("ctype");copy_string("class");copy_string("server");copy_string("region");
+    copy_number("level");copy_number("xp");copy_number("gold");
+    static const std::set<std::string> stat_allow={"attack","hp","max_hp","mp","max_mp","armor","resistance","apiercing","rpiercing","frequency","speed","range","crit","evasion","reflection","lifesteal","manasteal","mp_reduction","hp_regen","mp_regen","output","heal","str","dex","int","vit","for"};
+    if(input.contains("stats")&&input["stats"].is_object())for(auto it=input["stats"].begin();it!=input["stats"].end();++it)if(stat_allow.count(it.key())&&it.value().is_number())out["stats"][it.key()]=it.value();
+    // Adventure Land exports often expose observed stats directly at the root.
+    for(auto& k:stat_allow)if(input.contains(k)&&input[k].is_number())out["stats"][k]=input[k];
+    if(input.contains("slots")&&input["slots"].is_object()){
+        for(auto it=input["slots"].begin();it!=input["slots"].end();++it){
+            if(!it.value().is_object())continue;
+            json slot;
+            if(it.value().contains("name")&&it.value()["name"].is_string())slot["name"]=it.value()["name"];
+            if(it.value().contains("id")&&it.value()["id"].is_string())slot["id"]=it.value()["id"];
+            if(it.value().contains("level")&&it.value()["level"].is_number_integer())slot["level"]=it.value()["level"];
+            if(!slot.empty())out["slots"][it.key()]=slot;
+        }
     }
-    if(rows_.empty())p_.text(x+24,y+78,"No matching records.",MUTED,false);
+    if(input.contains("items")&&input["items"].is_array()){
+        out["items"]=json::array();
+        for(auto& v:input["items"]){if(!v.is_object())continue;json x;if(v.contains("name")&&v["name"].is_string())x["name"]=v["name"];if(v.contains("level")&&v["level"].is_number_integer())x["level"]=v["level"];if(v.contains("q")&&v["q"].is_number())x["q"]=v["q"];if(!x.empty())out["items"].push_back(x);}
+    }
+    return out;
 }
 
-void App::wrapped_text(int x,int& y,int maxw,const std::string& s,Color c,int max_lines){
-    std::istringstream is(s);std::string word,line;int lines=0;
-    while(is>>word && lines<max_lines){std::string test=line.empty()?word:line+" "+word;if(p_.text_width(test)>maxw && !line.empty()){p_.text(x,y,line,c,false);y+=20;line=word;++lines;}else line=test;}
-    if(!line.empty()&&lines<max_lines){p_.text(x,y,line,c,false);y+=20;}
+std::string safe_filename(std::string s){
+    for(char& c:s)if(!std::isalnum((unsigned char)c)&&c!='-'&&c!='_')c='-';
+    while(s.find("--")!=std::string::npos)s.replace(s.find("--"),2,"-");
+    if(s.empty())s="export";
+    if(s.size()>80)s.resize(80);
+    return s;
 }
 
-void App::inspector(int x,int y,int w,int h){
-    p_.fill({x,y,w,h},PANEL); if(selected_<0 || selected_>=(int)rows_.size()){p_.text(x+18,y+20,"ENTITY INSPECTOR",CYAN,true);p_.text(x+18,y+52,"Select a row.",MUTED,false);return;}
-    auto&e=rows_[selected_];int yy=y+20;p_.text(x+18,yy,"ENTITY INSPECTOR",CYAN,true);yy+=34;p_.text(x+18,yy,e.name,WHITE,true);yy+=24;p_.text(x+18,yy,e.section+" / "+e.id,MUTED,false);yy+=34;
-    if(!e.description.empty()){p_.text(x+18,yy,"DESCRIPTION",PURPLE,true);yy+=24;wrapped_text(x+18,yy,w-36,e.description,TEXT,7);yy+=12;}
-    auto fs=db_.fields(e.section,e.id);if(!fs.empty()){p_.text(x+18,yy,"FIELDS",PURPLE,true);yy+=26;for(auto&f:fs){if(yy>y+h-40)break;p_.text(x+18,yy,f.key,MUTED,false);p_.text(x+w/2,yy,f.value,TEXT,false);yy+=20;}}
-    if(fs.empty()){p_.text(x+18,yy,"SOURCE",PURPLE,true);yy+=24;p_.text(x+18,yy,"Local normalized snapshot",MUTED,false);yy+=22;p_.text(x+18,yy,"Raw data kept in SQLite",MUTED,false);}
+using Point=std::pair<double,double>;
+bool geometry_blocked(const json& g,double x,double y,double margin){
+    if(g.contains("x_lines")&&g["x_lines"].is_array())for(auto&l:g["x_lines"])if(l.is_array()&&l.size()>=3&&l[0].is_number()&&l[1].is_number()&&l[2].is_number())if(std::abs(x-l[0].get<double>())<=margin&&y>=std::min(l[1].get<double>(),l[2].get<double>())-margin&&y<=std::max(l[1].get<double>(),l[2].get<double>())+margin)return true;
+    if(g.contains("y_lines")&&g["y_lines"].is_array())for(auto&l:g["y_lines"])if(l.is_array()&&l.size()>=3&&l[0].is_number()&&l[1].is_number()&&l[2].is_number())if(std::abs(y-l[0].get<double>())<=margin&&x>=std::min(l[1].get<double>(),l[2].get<double>())-margin&&x<=std::max(l[1].get<double>(),l[2].get<double>())+margin)return true;
+    return false;
+}
+std::vector<Point> geometry_path(const json& g,Point start,Point target,double cell){
+    cell=std::clamp(cell,10.0,80.0);std::vector<Point> pts={start,target};
+    if(g.contains("x_lines")&&g["x_lines"].is_array())for(auto&l:g["x_lines"])if(l.is_array()&&l.size()>=3&&l[0].is_number()&&l[1].is_number()&&l[2].is_number()){pts.push_back({l[0],l[1]});pts.push_back({l[0],l[2]});}
+    if(g.contains("y_lines")&&g["y_lines"].is_array())for(auto&l:g["y_lines"])if(l.is_array()&&l.size()>=3&&l[0].is_number()&&l[1].is_number()&&l[2].is_number()){pts.push_back({l[1],l[0]});pts.push_back({l[2],l[0]});}
+    if(pts.size()<2)return {};
+    double minx=pts[0].first,maxx=pts[0].first,miny=pts[0].second,maxy=pts[0].second;for(auto&p:pts){minx=std::min(minx,p.first);maxx=std::max(maxx,p.first);miny=std::min(miny,p.second);maxy=std::max(maxy,p.second);}minx-=cell*2;maxx+=cell*2;miny-=cell*2;maxy+=cell*2;
+    int nx=(int)std::ceil((maxx-minx)/cell)+1,ny=(int)std::ceil((maxy-miny)/cell)+1;if((long long)nx*ny>40000){cell*=std::sqrt((double)nx*ny/40000.0);nx=(int)std::ceil((maxx-minx)/cell)+1;ny=(int)std::ceil((maxy-miny)/cell)+1;}
+    auto nearest=[&](Point p){return std::pair<int,int>{std::clamp((int)std::llround((p.first-minx)/cell),0,nx-1),std::clamp((int)std::llround((p.second-miny)/cell),0,ny-1)};};auto S=nearest(start),T=nearest(target);auto key=[&](int i,int j){return (long long)j*nx+i;};auto coord=[&](int i,int j){return Point{minx+i*cell,miny+j*cell};};
+    std::queue<std::pair<int,int>> q;std::unordered_map<long long,long long> prev;std::unordered_set<long long> seen;q.push(S);seen.insert(key(S.first,S.second));
+    static const int D[8][2]={{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};int visited=0;
+    while(!q.empty()&&visited++<50000){auto [i,j]=q.front();q.pop();if(i==T.first&&j==T.second)break;for(auto&d:D){int a=i+d[0],b=j+d[1];if(a<0||b<0||a>=nx||b>=ny)continue;long long k=key(a,b);if(seen.count(k))continue;auto [x,y]=coord(a,b);if(geometry_blocked(g,x,y,std::max(5.0,cell*.23)))continue;seen.insert(k);prev[k]=key(i,j);q.push({a,b});}}
+    long long tk=key(T.first,T.second),sk=key(S.first,S.second);if(!seen.count(tk))return {};std::vector<Point> rev;for(long long k=tk;;){int j=(int)(k/nx),i=(int)(k-(long long)j*nx);rev.push_back(coord(i,j));if(k==sk)break;auto it=prev.find(k);if(it==prev.end())return {};k=it->second;}std::reverse(rev.begin(),rev.end());if(!rev.empty()){rev.front()=start;rev.back()=target;}return rev;
+}
+
+std::vector<SchemaField> schema_from_object(const json& section){
+    std::map<std::string,std::map<std::string,int>> acc;int records=0;
+    std::function<void(const json&,const std::string&,int)> walk=[&](const json& j,const std::string&p,int depth){if(depth>6||!j.is_object())return;for(auto it=j.begin();it!=j.end();++it){std::string q=p.empty()?it.key():p+"."+it.key();std::string t=it.value().is_object()?"object":it.value().is_array()?"array":it.value().is_string()?"string":it.value().is_boolean()?"boolean":it.value().is_number()?"number":it.value().is_null()?"null":"unknown";acc[q][t]++;if(it.value().is_object())walk(it.value(),q,depth+1);}};
+    if(section.is_object())for(auto it=section.begin();it!=section.end();++it){records++;if(it.value().is_object())walk(it.value(),"",0);}
+    std::vector<SchemaField> out;for(auto&[p,types]:acc){auto best=std::max_element(types.begin(),types.end(),[](auto&a,auto&b){return a.second<b.second;});int total=0;for(auto&[t,n]:types)total+=n;out.push_back({p,best==types.end()?"unknown":best->first,total,records?double(total)/records:0});}std::sort(out.begin(),out.end(),[](auto&a,auto&b){return a.path<b.path;});return out;
+}
+
+}
+
+void App::render_runtime(){
+    title("SERVER RUNTIME // EXPLICIT SCENARIO LAYER","Runtime / Event Simulator","Legt die in der Web-Version modellierten Realm- und Event-Mutationen als separate Ebene ueber den unveraenderten G.*-Datensatz. Exact Drops, Farming und Combat verwenden die Ebene, wenn sie aktiviert ist.");
+    bool enabled=runtime_.value("enabled",false);if(ImGui::Checkbox("Runtime-Layer global anwenden",&enabled))runtime_["enabled"]=enabled;
+    std::string mode=runtime_.value("mode","normal");ImGui::SameLine();if(ImGui::BeginCombo("Realm",mode.c_str())){for(auto m:{"normal","hardcore"})if(ImGui::Selectable(m,mode==m)){mode=m;runtime_["mode"]=m;}ImGui::EndCombo();}
+    bool pvp=runtime_.value("pvp",false);ImGui::SameLine();if(ImGui::Checkbox("PvP-Realm",&pvp))runtime_["pvp"]=pvp;
+    if(!runtime_.contains("events")||!runtime_["events"].is_object())runtime_["events"]=json::object();
+    ImGui::SeparatorText("Event flags");for(auto key:{"halloween","holidayseason","lunarnewyear","valentines","egghunt"}){bool on=runtime_["events"].value(key,false);ImGui::PushID(key);if(ImGui::Checkbox(human(key).c_str(),&on))runtime_["events"][key]=on;ImGui::PopID();if(key!=std::string("egghunt"))ImGui::SameLine();}
+    auto r=runtime_layer(db_,runtime_);auto& changes=r["changes"];ImGui::Spacing();ImGui::TextColored(enabled?WARN:MUTED,"Layer: %s   Realm: %s   Explicit mutations: %zu",enabled?"ACTIVE":"PREVIEW",mode.c_str(),changes.size());
+    if(ImGui::BeginTable("runtimeChanges",3,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Path");ImGui::TableSetupColumn("Before");ImGui::TableSetupColumn("After");ImGui::TableHeadersRow();for(auto&c:changes){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(c.value("path","").c_str());ImGui::TableNextColumn();ImGui::TextWrapped("%s",flatten_scalar(c.value("before",json())).c_str());ImGui::TableNextColumn();ImGui::TextWrapped("%s",flatten_scalar(c.value("after",json())).c_str());}ImGui::EndTable();}
+    save_state();
+}
+
+void App::render_character_import(){
+    title("PLAYER CONTEXT // SANITIZED LOCAL IMPORT","Character Import","Importiert nur eine explizite Allowlist aus Character-JSON. Passwords, auth/session Daten und unbekannte Root-Felder werden verworfen. Alles bleibt lokal.");
+    static std::string input;static std::string path;
+    if(ImGui::Button("PASTE CLIPBOARD")){const char* c=ImGui::GetClipboardText();if(c)input=c;}ImGui::SameLine();ImGui::SetNextItemWidth(420);ImGui::InputTextWithHint("##charpath","Optional: Pfad zu character.json",&path);ImGui::SameLine();if(ImGui::Button("LOAD FILE")&&!path.empty()){std::ifstream f(path,std::ios::binary);if(f){std::ostringstream ss;ss<<f.rdbuf();input=ss.str();}else push_error("Character-Datei konnte nicht geoeffnet werden: "+path);}
+    ImGui::InputTextMultiline("##characterjson",&input,ImVec2(-1,190),ImGuiInputTextFlags_AllowTabInput);
+    if(ImGui::Button("SANITIZE + IMPORT")){
+        try{json raw=json::parse(input);json c=sanitize_character(raw);if(c.empty())throw std::runtime_error("Keine erlaubten Character-Felder gefunden");c["id"]="char-"+now_stamp();c["imported_at"]=now_stamp();characters_.push_back(c);sel_["active_character"]=c["id"].get<std::string>();save_state();input.clear();}
+        catch(const std::exception&e){push_error(std::string("Character Import: ")+e.what());}
+    }
+    ImGui::SeparatorText("Local characters");
+    if(ImGui::BeginTable("characters",5,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Name");ImGui::TableSetupColumn("Class");ImGui::TableSetupColumn("Level");ImGui::TableSetupColumn("Observed stats");ImGui::TableSetupColumn("Actions");ImGui::TableHeadersRow();for(size_t i=0;i<characters_.size();++i){auto&c=characters_[i];ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(c.value("name","unnamed").c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(c.value("ctype",c.value("class","?")).c_str());ImGui::TableNextColumn();ImGui::Text("%d",c.value("level",0));ImGui::TableNextColumn();ImGui::Text("%zu",c.value("stats",json::object()).size());ImGui::TableNextColumn();ImGui::PushID((int)i);if(ImGui::SmallButton("LOAD BUILD")){build_a_.class_id=c.value("ctype",c.value("class",build_a_.class_id));build_a_.level=c.value("level",build_a_.level);build_a_.slots.clear();if(c.contains("slots")&&c["slots"].is_object())for(auto it=c["slots"].begin();it!=c["slots"].end();++it){auto v=it.value();std::string id=v.value("name",v.value("id",""));build_a_.slots[it.key()]={id,v.value("level",0)};}sel_["active_character"]=c.value("id","");route_="combatLab";save_state();}ImGui::SameLine();if(ImGui::SmallButton("DELETE")){characters_.erase(characters_.begin()+i);save_state();ImGui::PopID();break;}ImGui::PopID();}ImGui::EndTable();}
+}
+
+void App::render_search_lab(){
+    title("QUERY DSL // NATIVE INDEX","Advanced Search","Kombiniert freie Begriffe mit Feldfiltern. Syntax: field:value, attack>100, hp<=50000, -event:true, section:items und nested.field:value.");
+    std::string& q=sel_["search_query"];ImGui::SetNextItemWidth(std::max(350.0f,ImGui::GetContentRegionAvail().x-110));bool enter=ImGui::InputTextWithHint("##advancedQuery","section:items type:weapon attack>100 upgrade:true",&q,ImGuiInputTextFlags_EnterReturnsTrue);ImGui::SameLine();bool run=ImGui::Button("SEARCH")||enter;
+    const char* examples[]={"type:weapon attack>100","section:monsters hp<50000 damage_type:physical","section:items class:ranger -event:true","section:maps pvp:true","fireblade attack>=50"};for(int i=0;i<5;i++){ImGui::PushID(i);if(ImGui::SmallButton(examples[i])){q=examples[i];run=true;}ImGui::PopID();if(i<4)ImGui::SameLine();}
+    static std::vector<Entity> results;static std::string last;if(run||q!=last){last=q;results=engine_.advanced_search(q,"",500);}
+    ImGui::TextDisabled("%zu Treffer",results.size());if(ImGui::BeginTable("searchResults",4,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Section",ImGuiTableColumnFlags_WidthFixed,100);ImGui::TableSetupColumn("ID",ImGuiTableColumnFlags_WidthFixed,180);ImGui::TableSetupColumn("Name",ImGuiTableColumnFlags_WidthFixed,220);ImGui::TableSetupColumn("Description");ImGui::TableHeadersRow();ImGuiListClipper clip;clip.Begin((int)results.size());while(clip.Step())for(int i=clip.DisplayStart;i<clip.DisplayEnd;i++){auto&e=results[i];ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextColored(PURPLE,"%s",e.section.c_str());ImGui::TableNextColumn();if(ImGui::Selectable(e.id.c_str()))select_entity(e.section,e.id);ImGui::TableNextColumn();ImGui::TextUnformatted(e.name.c_str());ImGui::TableNextColumn();ImGui::TextWrapped("%s",e.description.c_str());}ImGui::EndTable();}
+}
+
+void App::render_workspaces(){
+    title("RESEARCH SESSION // IDE-LIKE STATE","Workspaces","Speichert Route, Entity Context, Tabs, Build A/B, Runtime, Search, Favoriten und Tool-Parameter lokal. Export/Import verwendet versioniertes JSON.");
+    std::string& name=sel_["workspace_name"];if(name.empty())name="Adventure Research";ImGui::SetNextItemWidth(300);ImGui::InputText("Name",&name);ImGui::SameLine();if(ImGui::Button("SAVE CURRENT STATE")){json ws={{"format","al-native-workspace"},{"version",1},{"id","ws-"+now_stamp()},{"name",name},{"updated_at",now_stamp()},{"state",serialize_state()}};workspaces_.push_back(ws);save_state();}
+    ImGui::SameLine();if(ImGui::Button("EXPORT ACTIVE/LATEST")&&!workspaces_.empty()){auto&ws=workspaces_.back();fs::path d=fs::path(data_dir_)/"exports";fs::create_directories(d);fs::path p=d/("workspace-"+safe_filename(ws.value("name","workspace"))+"-"+now_stamp()+".json");if(write_json(p,ws))sel_["last_export"]=p.string();}
+    if(sel_.count("last_export"))ImGui::TextDisabled("Last export: %s",sel_["last_export"].c_str());
+    static std::string import_text,import_path;ImGui::SeparatorText("Import");ImGui::SetNextItemWidth(430);ImGui::InputTextWithHint("##wspath","Workspace JSON path",&import_path);ImGui::SameLine();if(ImGui::Button("READ")&&!import_path.empty()){auto j=read_json(import_path);if(j.is_object())import_text=j.dump(2);else push_error("Workspace-Datei ungueltig");}ImGui::InputTextMultiline("##wsimport",&import_text,ImVec2(-1,100));if(ImGui::Button("IMPORT WORKSPACE")){try{auto j=json::parse(import_text);if(j.value("format","")!="al-native-workspace"||!j.contains("state"))throw std::runtime_error("Falsches Workspace-Format");if(!j.contains("id"))j["id"]="ws-"+now_stamp();workspaces_.push_back(j);save_state();import_text.clear();}catch(const std::exception&e){push_error(std::string("Workspace import: ")+e.what());}}
+    ImGui::SeparatorText("Saved workspaces");if(ImGui::BeginTable("workspaces",5,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Name");ImGui::TableSetupColumn("Updated");ImGui::TableSetupColumn("Route");ImGui::TableSetupColumn("Entity");ImGui::TableSetupColumn("Actions");ImGui::TableHeadersRow();for(size_t i=0;i<workspaces_.size();++i){auto&ws=workspaces_[i];auto st=ws.value("state",json::object());ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(ws.value("name","workspace").c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(ws.value("updated_at","").c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(st.value("route","").c_str());ImGui::TableNextColumn();auto se=st.value("selected",json::object());ImGui::Text("%s:%s",se.value("section","").c_str(),se.value("id","").c_str());ImGui::TableNextColumn();ImGui::PushID((int)i);if(ImGui::SmallButton("LOAD")){restore_state(st);save_state();}ImGui::SameLine();if(ImGui::SmallButton("DELETE")){workspaces_.erase(workspaces_.begin()+i);save_state();ImGui::PopID();break;}ImGui::PopID();}ImGui::EndTable();}
+}
+
+void App::render_schema(){
+    title("SCHEMA CONTRACT // REGRESSION","Schema Explorer","Inventarisiert Pfade, Typen und Praevalenz pro G.*-Sektion. Eine lokale Baseline ermoeglicht Added/Removed/Type-Regressionen nach Game-Updates.");
+    std::string& sec=sel_["schema_section"];if(sec.empty())sec="items";if(ImGui::BeginCombo("Section",sec.c_str())){for(auto&s:db_.sections())if(ImGui::Selectable(s.c_str(),sec==s))sec=s;ImGui::EndCombo();}
+    auto fields=engine_.schema(sec);fs::path basePath=fs::path(data_dir_)/"schema-baseline.json";json baseline=read_json(basePath);if(ImGui::Button("SAVE CURRENT AS BASELINE")){json b=baseline.is_object()?baseline:json::object();json rows=json::array();for(auto&f:fields)rows.push_back({{"path",f.path},{"type",f.type},{"count",f.count},{"prevalence",f.prevalence}});b[sec]=rows;write_json(basePath,b);baseline=b;}ImGui::SameLine();ImGui::TextDisabled("%zu fields",fields.size());
+    std::map<std::string,std::string> prev;if(baseline.contains(sec)&&baseline[sec].is_array())for(auto&x:baseline[sec])prev[x.value("path","")]=x.value("type","");std::map<std::string,std::string> cur;for(auto&f:fields)cur[f.path]=f.type;int added=0,removed=0,changed=0;for(auto&[p,t]:cur)if(!prev.count(p))added++;else if(prev[p]!=t)changed++;for(auto&[p,t]:prev)if(!cur.count(p))removed++;ImGui::TextColored(added?GOOD:MUTED,"Added %d",added);ImGui::SameLine();ImGui::TextColored(changed?WARN:MUTED,"Type changed %d",changed);ImGui::SameLine();ImGui::TextColored(removed?BAD:MUTED,"Removed %d",removed);
+    std::string& filter=sel_["schema_filter"];ImGui::SetNextItemWidth(300);ImGui::InputTextWithHint("##schemafilter","Field path filter...",&filter);if(ImGui::BeginTable("schema",5,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("Path");ImGui::TableSetupColumn("Type");ImGui::TableSetupColumn("Records");ImGui::TableSetupColumn("Prevalence");ImGui::TableSetupColumn("Regression");ImGui::TableHeadersRow();for(auto&f:fields){if(!filter.empty()&&f.path.find(filter)==std::string::npos)continue;std::string reg=!prev.count(f.path)?"ADDED":prev[f.path]!=f.type?"TYPE":"";ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(f.path.c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(f.type.c_str());ImGui::TableNextColumn();ImGui::Text("%d",f.count);ImGui::TableNextColumn();ImGui::Text("%.1f%%",f.prevalence*100);ImGui::TableNextColumn();ImGui::TextColored(reg=="TYPE"?WARN:reg=="ADDED"?GOOD:MUTED,"%s",reg.c_str());}for(auto&[p,t]:prev)if(!cur.count(p)){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(p.c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(t.c_str());ImGui::TableNextColumn();ImGui::TextDisabled("-");ImGui::TableNextColumn();ImGui::TextDisabled("-");ImGui::TableNextColumn();ImGui::TextColored(BAD,"REMOVED");}ImGui::EndTable();}
+}
+
+void App::render_snapshots(){
+    title("OFFLINE DATASETS // LOCAL FILES","Offline Snapshots","Speichert den kompletten normalisierten G.*-Datensatz als versioniertes JSON. Ein Snapshot kann jederzeit ohne Netz wiederhergestellt werden.");
+    fs::path dir=fs::path(data_dir_)/"snapshots";fs::create_directories(dir);
+    if(ImGui::Button("SAVE CURRENT SNAPSHOT")){auto snap=db_.export_snapshot();if(snap.is_object()){fs::path p=dir/("snapshot-"+now_stamp()+".json");if(!write_json(p,snap))push_error("Snapshot konnte nicht geschrieben werden");}}
+    ImGui::SameLine();if(ImGui::Button("OPEN SNAPSHOT FOLDER PATH"))ImGui::SetClipboardText(dir.string().c_str());ImGui::TextDisabled("%s",dir.string().c_str());
+    std::vector<fs::path> files;for(auto&x:fs::directory_iterator(dir))if(x.is_regular_file()&&x.path().extension()==".json")files.push_back(x.path());std::sort(files.rbegin(),files.rend());
+    if(ImGui::BeginTable("snapshots",4,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,-1))){ImGui::TableSetupColumn("File");ImGui::TableSetupColumn("Size");ImGui::TableSetupColumn("Revision");ImGui::TableSetupColumn("Actions");ImGui::TableHeadersRow();for(size_t i=0;i<files.size();++i){auto j=read_json(files[i]);ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(files[i].filename().string().c_str());ImGui::TableNextColumn();std::error_code ec;auto sz=fs::file_size(files[i],ec);ImGui::Text("%llu KB",(unsigned long long)(sz/1024));ImGui::TableNextColumn();ImGui::TextUnformatted(j.value("meta",json::object()).value("revision","").substr(0,12).c_str());ImGui::TableNextColumn();ImGui::PushID((int)i);if(ImGui::SmallButton("RESTORE"))restore_snapshot_file(files[i].string());ImGui::SameLine();if(ImGui::SmallButton("DELETE")){fs::remove(files[i],ec);ImGui::PopID();break;}ImGui::PopID();}ImGui::EndTable();}
+}
+
+void App::render_selftest(){
+    title("REGRESSION // NATIVE CORE","Self Test","Fuehrt deterministische Kernpruefungen direkt gegen die aktive lokale Datenbank und Analyse-Engine aus.");
+    static json results=json::array();if(ImGui::Button("RUN ALL TESTS")||results.empty()){
+        results=json::array();auto test=[&](const std::string&name,const std::function<std::string()>&fn){try{results.push_back({{"name",name},{"ok",true},{"detail",fn()}});}catch(const std::exception&e){results.push_back({{"name",name},{"ok",false},{"detail",e.what()}});}};
+        test("SQLite integrity",[&]{std::string e;if(!db_.integrity_check(e))throw std::runtime_error(e);return std::string("ok");});
+        test("Defense multiplier @100",[&]{double x=AnalysisEngine::damage_multiplier(100);if(std::abs(x-.9)>1e-9)throw std::runtime_error(pretty_num(x));return pretty_num(x);});
+        test("Required datasets",[&]{if(db_.count("items")<40||db_.count("monsters")<30||db_.count("skills")<40)throw std::runtime_error("dataset unexpectedly small");return std::to_string(db_.total())+" entities";});
+        test("FTS item search",[&]{auto r=db_.query("items","HP Potion",20);if(r.empty())throw std::runtime_error("no hits");return r.front().id;});
+        test("Advanced Search DSL",[&]{auto r=engine_.advanced_search("section:items type:weapon", "",20);if(r.empty())throw std::runtime_error("no weapon hit");return std::to_string(r.size())+" hits";});
+        test("Exact Drop engine",[&]{auto mons=db_.section_json("drops").value("monsters",json::object());if(!mons.is_object()||mons.empty())throw std::runtime_error("no monster drops");auto id=mons.begin().key();auto r=engine_.drop_paths("monster",id);return id+": "+std::to_string(r.size())+" paths";});
+        test("Runtime Halloween",[&]{json r=runtime_;r["events"]["halloween"]=true;auto x=runtime_layer(db_,r);auto g=x["drops"].value("maps",json::object()).value("global",json::array());bool ok=false;for(auto&v:g)if(v.is_array()&&v.size()>1&&v[1]=="candy0")ok=true;if(!ok)throw std::runtime_error("candy0 missing");return std::string("candy0 added");});
+        test("Character sanitizer",[&]{auto c=sanitize_character({{"name","T"},{"ctype","mage"},{"password","secret"},{"attack",10}});if(c.contains("password")||!c.value("stats",json::object()).contains("attack"))throw std::runtime_error("sanitizer mismatch");return std::string("secret stripped");});
+        test("Schema explorer",[&]{auto s=engine_.schema("items");if(s.empty())throw std::runtime_error("empty schema");return std::to_string(s.size())+" fields";});
+        test("Snapshot roundtrip shape",[&]{auto s=db_.export_snapshot();if(!s.contains("data")||!s["data"].contains("items"))throw std::runtime_error("missing data.items");return std::string("ok");});
+    }
+    int pass=0;for(auto&r:results)if(r.value("ok",false))pass++;ImGui::TextColored(pass==(int)results.size()?GOOD:WARN,"%d / %zu PASS",pass,results.size());if(ImGui::BeginTable("selftests",3,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg)){ImGui::TableSetupColumn("Status",ImGuiTableColumnFlags_WidthFixed,70);ImGui::TableSetupColumn("Test",ImGuiTableColumnFlags_WidthFixed,260);ImGui::TableSetupColumn("Detail");ImGui::TableHeadersRow();for(auto&r:results){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextColored(r.value("ok",false)?GOOD:BAD,"%s",r.value("ok",false)?"PASS":"FAIL");ImGui::TableNextColumn();ImGui::TextUnformatted(r.value("name","").c_str());ImGui::TableNextColumn();ImGui::TextWrapped("%s",r.value("detail","").c_str());}ImGui::EndTable();}
+}
+
+void App::render_atlas(){
+    title("G.GEOMETRY // COLLISION LINES","Geometry Atlas","Importiert echte G.geometry x_lines/y_lines lokal und zeichnet sie GPU-basiert. Die Pfadprobe ist ein abgeleitetes Grid und behauptet nicht, smart_move zu ersetzen.");
+    std::string& map=sel_["atlas_map"];if(map.empty())map="main";entity_combo("Map","maps",map);
+    static std::string input,path;if(ImGui::Button("PASTE GEOMETRY")){const char*c=ImGui::GetClipboardText();if(c)input=c;}ImGui::SameLine();ImGui::SetNextItemWidth(400);ImGui::InputTextWithHint("##geopath","Optional geometry JSON file path",&path);ImGui::SameLine();if(ImGui::Button("LOAD FILE")&&!path.empty()){std::ifstream f(path);if(f){std::ostringstream ss;ss<<f.rdbuf();input=ss.str();}}
+    if(ImGui::TreeNode("Geometry Import")){ImGui::InputTextMultiline("##geojson",&input,ImVec2(-1,130));if(ImGui::Button("IMPORT")){try{auto j=json::parse(input);if(j.contains("map")&&j.contains("geometry")&&j["map"].is_string()&&j["geometry"].is_object())geometry_[j["map"].get<std::string>()]=j["geometry"];else if(j.is_object()){for(auto it=j.begin();it!=j.end();++it)if(it.value().is_object()&&(it.value().contains("x_lines")||it.value().contains("y_lines")))geometry_[it.key()]=it.value();}else throw std::runtime_error("unsupported geometry format");save_state();input.clear();}catch(const std::exception&e){push_error(std::string("Geometry import: ")+e.what());}}ImGui::TreePop();}
+    json g=geometry_.value(map,json::object());size_t xl=g.value("x_lines",json::array()).size(),yl=g.value("y_lines",json::array()).size();ImGui::Text("x_lines %zu   y_lines %zu",xl,yl);
+    static double sx=0,sy=0,ex=300,ey=300,cell=28;ImGui::InputDouble("Start X",&sx);ImGui::SameLine();ImGui::InputDouble("Start Y",&sy);ImGui::InputDouble("End X",&ex);ImGui::SameLine();ImGui::InputDouble("End Y",&ey);ImGui::InputDouble("Grid cell",&cell);static std::vector<Point> pathPts;if(ImGui::Button("CALCULATE PATH")){pathPts=geometry_path(g,{sx,sy},{ex,ey},cell);}
+    std::vector<Point> pts={{sx,sy},{ex,ey}};auto addLinePts=[&](const char*k,bool xline){if(g.contains(k)&&g[k].is_array())for(auto&l:g[k])if(l.is_array()&&l.size()>=3&&l[0].is_number()&&l[1].is_number()&&l[2].is_number()){if(xline){pts.push_back({l[0],l[1]});pts.push_back({l[0],l[2]});}else{pts.push_back({l[1],l[0]});pts.push_back({l[2],l[0]});}}};addLinePts("x_lines",true);addLinePts("y_lines",false);for(auto&p:pathPts)pts.push_back(p);
+    ImVec2 canvas(ImGui::GetContentRegionAvail().x,420);ImGui::InvisibleButton("geometryCanvas",canvas);auto*dl=ImGui::GetWindowDrawList();ImVec2 o=ImGui::GetItemRectMin();dl->AddRectFilled(o,{o.x+canvas.x,o.y+canvas.y},IM_COL32(6,13,22,255));double minx=-1,maxx=1,miny=-1,maxy=1;if(!pts.empty()){minx=maxx=pts[0].first;miny=maxy=pts[0].second;for(auto&p:pts){minx=std::min(minx,p.first);maxx=std::max(maxx,p.first);miny=std::min(miny,p.second);maxy=std::max(maxy,p.second);}}double dx=std::max(1.0,maxx-minx),dy=std::max(1.0,maxy-miny);auto tr=[&](double x,double y){return ImVec2(o.x+12+(float)((x-minx)/dx*(canvas.x-24)),o.y+12+(float)((y-miny)/dy*(canvas.y-24)));};
+    if(g.contains("x_lines")&&g["x_lines"].is_array())for(auto&l:g["x_lines"])if(l.is_array()&&l.size()>=3&&l[0].is_number()&&l[1].is_number()&&l[2].is_number())dl->AddLine(tr(l[0],l[1]),tr(l[0],l[2]),IM_COL32(110,135,160,255),1.2f);if(g.contains("y_lines")&&g["y_lines"].is_array())for(auto&l:g["y_lines"])if(l.is_array()&&l.size()>=3&&l[0].is_number()&&l[1].is_number()&&l[2].is_number())dl->AddLine(tr(l[1],l[0]),tr(l[2],l[0]),IM_COL32(110,135,160,255),1.2f);for(size_t i=1;i<pathPts.size();++i)dl->AddLine(tr(pathPts[i-1].first,pathPts[i-1].second),tr(pathPts[i].first,pathPts[i].second),IM_COL32(58,225,213,255),2.5f);dl->AddCircleFilled(tr(sx,sy),5,IM_COL32(80,220,120,255));dl->AddCircleFilled(tr(ex,ey),5,IM_COL32(255,100,100,255));ImGui::TextDisabled("Derived path: %zu grid points",pathPts.size());
+}
+
+void App::render_health(){
+    title("V11.1 EQUIVALENT // NATIVE DIAGNOSTICS","System Health","Native Ersatz fuer Browser/PWA-Diagnosen: SQLite, Dateisystem, Source Sync, lokale Recovery, Backup/Restore und Session-Fehler. Keine Telemetrie.");
+    std::string dbErr;bool dbOk=db_.integrity_check(dbErr);std::error_code ec;auto free=fs::space(data_dir_,ec);double uptime=std::max(0.0,ImGui::GetTime()-uptime_start_);
+    if(ImGui::BeginTable("health",2,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg)){kv("SQLite integrity",dbOk?"OK":dbErr,dbOk?GOOD:BAD);kv("Indexed entities",std::to_string(db_.total()));kv("Revision",db_.meta("revision"));kv("Data directory",data_dir_);kv("Free disk",ec?"n/a":std::to_string((unsigned long long)(free.available/1024/1024))+" MB");kv("Session uptime",pretty_num(uptime)+" s");kv("Session errors",std::to_string(errors_.size()),errors_.empty()?GOOD:WARN);kv("Live sync",sync_running_?"RUNNING":"IDLE",sync_running_?WARN:GOOD);ImGui::EndTable();}
+    ImGui::SeparatorText("One-file Backup / Recovery");fs::path backupDir=fs::path(data_dir_)/"backups";fs::create_directories(backupDir);if(ImGui::Button("EXPORT ALL LOCAL DATA")){json backup={{"format","al-native-backup"},{"version",1},{"created_at",now_stamp()},{"dataset",db_.export_snapshot()},{"state",serialize_state()}};fs::path p=backupDir/("adventure-land-backup-"+now_stamp()+".json");if(write_json(p,backup))sel_["backup_path"]=p.string();else push_error("Backup write failed");}ImGui::SameLine();if(ImGui::Button("COPY BACKUP PATH")&&sel_.count("backup_path"))ImGui::SetClipboardText(sel_["backup_path"].c_str());if(sel_.count("backup_path"))ImGui::TextDisabled("%s",sel_["backup_path"].c_str());
+    std::string& restorePath=sel_["restore_backup_path"];ImGui::SetNextItemWidth(500);ImGui::InputTextWithHint("##restorepath","Pfad zu al-native-backup JSON",&restorePath);ImGui::SameLine();if(ImGui::Button("RESTORE BACKUP")&&!restorePath.empty()){try{auto b=read_json(restorePath);if(b.value("format","")!="al-native-backup"||!b.contains("dataset")||!b.contains("state"))throw std::runtime_error("invalid backup format");std::string e;if(!db_.replace_dataset(b["dataset"],e))throw std::runtime_error(e);restore_state(b["state"]);on_dataset_reloaded();save_state();}catch(const std::exception&e){push_error(std::string("Backup restore: ")+e.what());}}
+    ImGui::SeparatorText("Recovery");if(ImGui::Button("RESET UI STATE")){auto keep=source_history_;auto geo=geometry_;favorites_.clear();watchlist_.clear();sel_.clear();recent_entities_.clear();workspaces_=json::array();characters_=json::array();runtime_={{"enabled",false},{"mode","normal"},{"pvp",false},{"events",{{"halloween",false},{"holidayseason",false},{"lunarnewyear",false},{"valentines",false},{"egghunt",false}}}};source_history_=keep;geometry_=geo;route_="dashboard";save_state();}ImGui::SameLine();if(ImGui::Button("RUN SELF TEST"))route_="selftest";
+    ImGui::SeparatorText("Session Errors");if(ImGui::Button("CLEAR ERRORS"))errors_.clear();for(auto&e:errors_)ImGui::TextColored(BAD,"%s",e.c_str());
+}
+
+std::unordered_map<std::string,std::string> App::dataset_signatures(){
+    std::unordered_map<std::string,std::string> out;for(auto&sec:db_.sections())for(auto&e:db_.all(sec,100000))out[entity_key(sec,e.id)]=sha256_hex(e.raw);return out;
+}
+
+json App::diff_signatures(const std::unordered_map<std::string,std::string>& before,const std::unordered_map<std::string,std::string>& after){
+    json out=json::array();std::set<std::string> keys;for(auto&[k,v]:before)keys.insert(k);for(auto&[k,v]:after)keys.insert(k);for(auto&k:keys){auto a=before.find(k),b=after.find(k);std::string type;if(a==before.end())type="added";else if(b==after.end())type="removed";else if(a->second!=b->second)type="changed";else continue;auto p=k.find(':');out.push_back({{"type",type},{"key",k},{"section",p==std::string::npos?"":k.substr(0,p)},{"id",p==std::string::npos?k:k.substr(p+1)}});}return out;
+}
+
+bool App::archive_snapshot(const json& snap,std::string& path_out){
+    fs::path dir=fs::path(data_dir_)/"sources";fs::create_directories(dir);std::string rev=snap.value("meta",json::object()).value("revision","snapshot");fs::path p=dir/("source-"+safe_filename(rev.substr(0,16))+"-"+now_stamp()+".json");if(!write_json(p,snap))return false;path_out=p.string();return true;
+}
+
+bool App::restore_snapshot_file(const std::string& path){
+    if(path.empty())return false;auto snap=read_json(path);if(!snap.is_object()){push_error("Snapshot ungueltig: "+path);return false;}std::string e;if(!db_.replace_dataset(snap,e)){push_error("Snapshot restore: "+e);return false;}on_dataset_reloaded();save_state();return true;
+}
+
+void App::start_sync(){
+    if(sync_running_)return;sync_before_=dataset_signatures();sync_done_=0;sync_total_=1;{std::lock_guard<std::mutex>g(sync_mu_);sync_label_="Starting";}sync_running_=true;
+    sync_future_=std::async(std::launch::async,[this]{return sync_.run([this](int done,int total,const std::string& label){sync_done_=done;sync_total_=total;std::lock_guard<std::mutex>g(sync_mu_);sync_label_=label;});});
+}
+
+void App::poll_sync(){
+    if(!sync_running_||!sync_future_.valid())return;if(sync_future_.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready)return;SyncResult r=sync_future_.get();sync_running_=false;if(!r.ok){push_error("LIVE SYNC: "+r.error);return;}std::string archive;if(!archive_snapshot(r.snapshot,archive))push_error("Source archive konnte nicht gespeichert werden");std::string err;if(!db_.replace_dataset(r.snapshot,err)){push_error("LIVE SYNC DB replace: "+err);return;}on_dataset_reloaded();auto after=dataset_signatures();last_diff_=diff_signatures(sync_before_,after);auto meta=r.snapshot.value("meta",json::object());source_history_.insert(source_history_.begin(),{{"revision",meta.value("revision","")},{"date",meta.value("revision_date",now_stamp())},{"files",(int)r.snapshot.value("sources",json::array()).size()},{"archive",archive},{"manifest_sha256",meta.value("manifest_sha256","")}});if(source_history_.size()>30)source_history_.erase(source_history_.begin()+30,source_history_.end());save_state();
+}
+
+void App::command_palette(){
+    if(command_open_){ImGui::OpenPopup("COMMAND PALETTE");command_open_=false;focus_global_search_=false;}
+    ImGui::SetNextWindowSize(ImVec2(std::min(760.0f,ImGui::GetIO().DisplaySize.x-80),520),ImGuiCond_Appearing);
+    if(ImGui::BeginPopupModal("COMMAND PALETTE",nullptr,ImGuiWindowFlags_NoResize)){
+        static std::string q;static bool first=true;if(first){ImGui::SetKeyboardFocusHere();first=false;}
+        ImGui::SetNextItemWidth(-1);if(ImGui::InputTextWithHint("##cmdq","Tool, Section oder Entity suchen...",&q,ImGuiInputTextFlags_EnterReturnsTrue)){}
+        const std::vector<std::pair<std::string,std::string>> commands={
+            {"dashboard","Dashboard"},{"dropsExplorer","Exact Drop Engine"},{"forge","Upgrade Lab"},{"dependency","Craft Graph"},{"compare","Monster Compare"},{"builds","Build Designer"},{"economy","Economy Lab"},{"farming","Farm Calculator"},{"buildCompare","Build Compare"},{"skillsim","Skill Simulator"},{"routes","Spawn Route Planner"},{"acquisition","Acquisition Graph"},{"world","World / Spawns"},{"atlas","Geometry Atlas"},{"graph","Knowledge Graph"},{"universalCompare","Universal Compare"},{"combatLab","Combat Lab 2.0"},{"integrity","Integrity Scanner"},{"sources","Source Versions"},{"changes","Update Diff"},{"runtime","Runtime / Events"},{"characterImport","Character Import"},{"searchLab","Advanced Search"},{"workspaces","Workspaces"},{"schema","Schema Explorer"},{"snapshots","Offline Snapshots"},{"selftest","Self Test"},{"health","System Health"},{"raw","Raw Data"}};
+        auto lower=[](std::string x){std::transform(x.begin(),x.end(),x.begin(),[](unsigned char c){return(char)std::tolower(c);});return x;};std::string needle=lower(q);
+        ImGui::SeparatorText("Commands");for(auto&[route,label]:commands){if(!needle.empty()&&lower(route+" "+label).find(needle)==std::string::npos)continue;if(ImGui::Selectable((label+"  //  "+route).c_str())){route_=route;q.clear();first=true;ImGui::CloseCurrentPopup();save_state();}}
+        if(!q.empty()){
+            auto hits=db_.query("",q,30);if(!hits.empty()){ImGui::SeparatorText("Entities");for(auto&e:hits){std::string label="G."+e.section+"."+e.id+"   "+e.name;if(ImGui::Selectable(label.c_str())){select_entity(e.section,e.id);route_=e.section;q.clear();first=true;ImGui::CloseCurrentPopup();}}}
+        }
+        ImGui::Separator();if(ImGui::Button("CLOSE")||ImGui::IsKeyPressed(ImGuiKey_Escape)){q.clear();first=true;ImGui::CloseCurrentPopup();}
+        ImGui::EndPopup();
+    }
+}
+
+void App::render_raw(){
+    title("SOURCE DATA // LOSSLESS VIEW","Raw Data","Zeigt komplette normalisierte G.*-Sektionen ohne UI-Schema-Verlust. Grosse Objekte werden als Baum dargestellt.");
+    static std::string sec;auto sections=db_.sections();if(sec.empty()&&!sections.empty())sec=sections.front();if(ImGui::BeginCombo("Section",sec.c_str())){for(auto&s:sections)if(ImGui::Selectable(s.c_str(),sec==s))sec=s;ImGui::EndCombo();}
+    json j=db_.section_json(sec);ImGui::TextDisabled("G.%s // %zu top-level records",sec.c_str(),j.is_object()?j.size():0);json_tree(j,"G."+sec);
 }
