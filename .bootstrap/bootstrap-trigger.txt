@@ -1,1 +1,1 @@
-native-parity-v1
+native-parity-v2
