@@ -99,7 +99,7 @@ jobs:
         shell: pwsh
         run: .\build\Release\al-core-test.exe .\resources\reference.db
 
-      - name: Package
+      - name: Package standard Windows build
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force package\AdventureLandReferenceOS\resources | Out-Null
@@ -108,10 +108,44 @@ jobs:
           Copy-Item README.md package\AdventureLandReferenceOS\README.md
           Compress-Archive -Path package\AdventureLandReferenceOS -DestinationPath AdventureLandReferenceOS-Windows-x64.zip -Force
 
+      - name: Package silent portable Windows build
+        shell: pwsh
+        run: |
+          $root = 'package\AdventureLandReferenceOS-Portable'
+          New-Item -ItemType Directory -Force "$root\resources" | Out-Null
+          New-Item -ItemType Directory -Force "$root\data" | Out-Null
+          Copy-Item build\Release\adventure-land-reference-os.exe "$root\AdventureLandReferenceOS.exe"
+          Copy-Item resources\reference.db "$root\resources\reference.db"
+          Copy-Item README.md "$root\README.md"
+          New-Item -ItemType File -Force "$root\portable.flag" | Out-Null
+          @(
+            'ADVENTURE LAND REFERENCE OS - WINDOWS x64 PORTABLE',
+            '',
+            'Start: Double-click AdventureLandReferenceOS.exe',
+            '',
+            'No installer and no launcher script are required.',
+            'The application is built as a Windows GUI program, so no console window is opened.',
+            'Because portable.flag is present, all persistent state is stored in the local data folder.',
+            'Keep the complete folder together when moving it to another PC or USB drive.',
+            '',
+            'F11 = fullscreen toggle',
+            'Esc = leave fullscreen',
+            'Ctrl+K = command/search palette'
+          ) | Set-Content -Encoding UTF8 "$root\README-PORTABLE.txt"
+          Compress-Archive -Path $root -DestinationPath AdventureLandReferenceOS-Windows-x64-Portable.zip -Force
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: AdventureLandReferenceOS-Windows-x64
           path: AdventureLandReferenceOS-Windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload Windows portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdventureLandReferenceOS-Windows-x64-Portable
+          path: AdventureLandReferenceOS-Windows-x64-Portable.zip
           if-no-files-found: error
           compression-level: 0
