@@ -33,6 +33,12 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Patch TypeScript build config
+        working-directory: tauri-app
+        shell: pwsh
+        run: |
+          node -e "const fs=require('fs');const p='tsconfig.node.json';const x=JSON.parse(fs.readFileSync(p,'utf8'));x.compilerOptions.noEmit=true;fs.writeFileSync(p,JSON.stringify(x,null,2)+'\n')"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
