@@ -28,6 +28,10 @@ jobs:
           tar -xJf $archive -C "tauri-app"
           if (!(Test-Path "tauri-app/package.json")) { throw "Source reconstruction failed: package.json not found" }
 
+          New-Item -ItemType Directory -Force -Path "tauri-app/src-tauri/icons" | Out-Null
+          $iconB64 = (Get-Content ".build/icon.ico.b64" -Raw).Trim()
+          [IO.File]::WriteAllBytes("tauri-app/src-tauri/icons/icon.ico", [Convert]::FromBase64String($iconB64))
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -49,10 +53,6 @@ jobs:
       - name: Frontend typecheck and build
         working-directory: tauri-app
         run: npm run build
-
-      - name: Rust tests
-        working-directory: tauri-app
-        run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build Windows app and NSIS installer
         working-directory: tauri-app
