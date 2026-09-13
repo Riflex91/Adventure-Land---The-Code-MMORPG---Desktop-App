@@ -1,0 +1,75 @@
+name: Build Tauri Windows
+
+on:
+  push:
+    branches:
+      - build/tauri-v0.1.0
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct Tauri source
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem ".build/tauri-source-xz.part*" | Sort-Object Name
+          if ($parts.Count -ne 3) { throw "Expected 3 source chunks, found $($parts.Count)" }
+          $b64 = ($parts | ForEach-Object { (Get-Content $_.FullName -Raw).Trim() }) -join ""
+          $archive = Join-Path $env:RUNNER_TEMP "tauri-source.tar.xz"
+          [IO.File]::WriteAllBytes($archive, [Convert]::FromBase64String($b64))
+          New-Item -ItemType Directory -Force -Path "tauri-app" | Out-Null
+          tar -xJf $archive -C "tauri-app"
+          if (!(Test-Path "tauri-app/package.json")) { throw "Source reconstruction failed: package.json not found" }
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        working-directory: tauri-app
+        run: npm install --no-audit --no-fund
+
+      - name: Frontend typecheck and build
+        working-directory: tauri-app
+        run: npm run build
+
+      - name: Rust tests
+        working-directory: tauri-app
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Windows app and NSIS installer
+        working-directory: tauri-app
+        run: npm run tauri -- build --bundles nsis
+
+      - name: Collect artifacts
+        shell: pwsh
+        working-directory: tauri-app
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          $portable = Get-ChildItem "src-tauri/target/release/*.exe" | Where-Object { $_.FullName -notmatch '\\bundle\\' } | Select-Object -First 1
+          if (!$portable) { throw "Portable executable not found" }
+          Copy-Item $portable.FullName "artifact/Adventure-Land-Atlas.exe"
+          $installers = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
+          if (!$installers) { throw "NSIS installer not found" }
+          foreach ($installer in $installers) {
+            Copy-Item $installer.FullName "artifact/$($installer.Name)"
+          }
+          Get-ChildItem artifact
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Adventure-Land-Atlas-Windows-v0.1.0
+          path: tauri-app/artifact/*
+          if-no-files-found: error
