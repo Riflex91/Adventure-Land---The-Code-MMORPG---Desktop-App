@@ -4,27 +4,16 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
-#include <vector>
-#define STB_IMAGE_IMPLEMENTATION
-#include <stb_image.h>
 
 namespace {
-std::vector<unsigned char> decode_base64(const char* s){
-    static int T[256]; static bool init=false;
-    if(!init){std::fill(std::begin(T),std::end(T),-1);const char* a="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";for(int i=0;i<64;i++)T[(unsigned char)a[i]]=i;init=true;}
-    std::vector<unsigned char> out;int val=0,valb=-8;
-    for(const unsigned char* p=(const unsigned char*)s;*p;++p){if(*p=='=')break;int d=T[*p];if(d<0)continue;val=(val<<6)+d;valb+=6;if(valb>=0){out.push_back((unsigned char)((val>>valb)&0xFF));valb-=8;}}
-    return out;
-}
 std::string lower(std::string s){for(char& c:s)c=(char)std::tolower((unsigned char)c);return s;}
 }
 
 IconCache::~IconCache(){shutdown();}
 
 bool IconCache::initialize(std::string& error){
-    shutdown();auto bytes=decode_base64(AL_ICON_ATLAS_PNG_BASE64);int channels=0;unsigned char* rgba=stbi_load_from_memory(bytes.data(),(int)bytes.size(),&width_,&height_,&channels,4);
-    if(!rgba){error=stbi_failure_reason()?stbi_failure_reason():"stb_image decode failed";return false;}
-    glGenTextures(1,&texture_);glBindTexture(GL_TEXTURE_2D,texture_);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);glPixelStorei(GL_UNPACK_ALIGNMENT,1);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,width_,height_,0,GL_RGBA,GL_UNSIGNED_BYTE,rgba);glBindTexture(GL_TEXTURE_2D,0);stbi_image_free(rgba);
+    shutdown();(void)error;width_=AL_ICON_ATLAS_WIDTH;height_=AL_ICON_ATLAS_HEIGHT;
+    glGenTextures(1,&texture_);glBindTexture(GL_TEXTURE_2D,texture_);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);glPixelStorei(GL_UNPACK_ALIGNMENT,1);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,width_,height_,0,GL_RGBA,GL_UNSIGNED_BYTE,AL_ICON_ATLAS_RGBA);glBindTexture(GL_TEXTURE_2D,0);
     regions_.reserve(AL_ICON_ENTRY_COUNT*2);
     for(std::size_t i=0;i<AL_ICON_ENTRY_COUNT;i++){auto&e=AL_ICON_ENTRIES[i];const float pad=0.5f;regions_[e.key]={(e.x+pad)/width_,(e.y+pad)/height_,(e.x+e.w-pad)/width_,(e.y+e.h-pad)/height_};}
     return true;
